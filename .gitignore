@@ -1,3 +1,4 @@
 /.claude
 /Cargo.lock
 /empty.txt
+target/
