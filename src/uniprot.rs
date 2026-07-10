@@ -3,7 +3,7 @@
 // ============================================================================
 
 use crate::types::UniprotId;
-use crate::util::{with_retries, RateLimiter};
+use crate::util::{with_retries, RateLimiter, RetryConfig};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 
@@ -200,12 +200,14 @@ fn build_uniprot_stream_url(accessions: &[String]) -> String {
     )
 }
 
-fn fetch_uniprot_batch(accessions: &[String]) -> Result<Vec<UniProtEntry>> {
+fn fetch_uniprot_batch(accessions: &[String], retry_config: &RetryConfig) -> Result<Vec<UniProtEntry>> {
     with_retries(
         &format!("fetching {} UniProt entries", accessions.len()),
+        retry_config,
         || {
             let url = build_uniprot_stream_url(accessions);
             let body = ureq::get(&url)
+                .timeout(retry_config.timeout)
                 .call()
                 .with_context(|| {
                     format!("UniProt request failed for {} accessions", accessions.len())
@@ -219,7 +221,14 @@ fn fetch_uniprot_batch(accessions: &[String]) -> Result<Vec<UniProtEntry>> {
     )
 }
 
-pub(crate) fn fetch_uniprot_entries(accessions: &[UniprotId]) -> HashMap<UniprotId, UniProtEntry> {
+/// Fetches all UniProt entries for `accessions`. A batch that still fails
+/// after retries is treated as fatal rather than being dropped: silently
+/// missing UniProt entries would otherwise surface as confusing downstream
+/// errors (e.g. missing ENST→isoform mappings) far from the real cause.
+pub(crate) fn fetch_uniprot_entries(
+    accessions: &[UniprotId],
+    retry_config: &RetryConfig,
+) -> Result<HashMap<UniprotId, UniProtEntry>> {
     let id_strings: Vec<String> = accessions
         .iter()
         .map(|id| id.as_str().to_string())
@@ -229,22 +238,14 @@ pub(crate) fn fetch_uniprot_entries(accessions: &[UniprotId]) -> HashMap<Uniprot
 
     for chunk in id_strings.chunks(MAX_UNIPROT_BATCH_SIZE) {
         rate_limiter.throttle();
-        match fetch_uniprot_batch(chunk) {
-            Ok(entries) => {
-                for entry in entries {
-                    by_accession.insert(entry.primary_accession.clone(), entry);
-                }
-            }
-            Err(e) => eprintln!(
-                "Warning: failed to fetch UniProt batch of {} accessions: {:?}",
-                chunk.len(),
-                e
-            ),
+        let entries = fetch_uniprot_batch(chunk, retry_config)?;
+        for entry in entries {
+            by_accession.insert(entry.primary_accession.clone(), entry);
         }
     }
 
-    accessions
+    Ok(accessions
         .iter()
         .filter_map(|id| by_accession.remove(id.as_str()).map(|e| (id.clone(), e)))
-        .collect()
+        .collect())
 }

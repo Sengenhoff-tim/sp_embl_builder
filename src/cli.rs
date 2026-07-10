@@ -2,6 +2,8 @@
 // CLI argument definition
 // ============================================================================
 
+use crate::util::{DEFAULT_MAX_ATTEMPTS, DEFAULT_RETRY_BACKOFF_MS, DEFAULT_TIMEOUT_SECS};
+
 #[derive(clap::Parser)]
 #[command(about = "Map variants from UniProt/EBI onto isoform sequences")]
 pub(crate) struct Cli {
@@ -27,4 +29,20 @@ pub(crate) struct Cli {
     /// `<identifier>\t<message>` lines.
     #[arg(long, default_value = "exceptions.log")]
     pub(crate) exceptions: String,
+
+    /// Per-request timeout, in seconds, for outgoing REST calls (UniProt,
+    /// EBI, Ensembl). Covers connect + write + read for a single attempt;
+    /// each attempt is retried independently on failure.
+    #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS)]
+    pub(crate) timeout_secs: u64,
+
+    /// Number of attempts (including the first) before a failed fetch is
+    /// treated as fatal and the program exits.
+    #[arg(long, default_value_t = DEFAULT_MAX_ATTEMPTS)]
+    pub(crate) max_attempts: u32,
+
+    /// Base backoff, in milliseconds, between retry attempts. Doubles after
+    /// each failed attempt (e.g. 500ms -> 1s -> 2s -> ...).
+    #[arg(long, default_value_t = DEFAULT_RETRY_BACKOFF_MS)]
+    pub(crate) retry_backoff_ms: u64,
 }

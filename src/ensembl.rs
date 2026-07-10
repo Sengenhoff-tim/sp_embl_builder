@@ -4,7 +4,7 @@
 
 use crate::exceptions::ExceptionLog;
 use crate::types::{EnsemblId, Sequence};
-use crate::util::with_retries;
+use crate::util::{with_retries, RetryConfig};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 
@@ -26,12 +26,17 @@ struct EnsemblSequenceResponse {
     response_id: String,
 }
 
-fn fetch_ensembl_sequence_batch(ids: &[String]) -> Result<Vec<EnsemblSequenceResponse>> {
+fn fetch_ensembl_sequence_batch(
+    ids: &[String],
+    retry_config: &RetryConfig,
+) -> Result<Vec<EnsemblSequenceResponse>> {
     with_retries(
         &format!("fetching Ensembl sequences for {} ids", ids.len()),
+        retry_config,
         || {
             let responses: Vec<EnsemblSequenceResponse> =
                 ureq::post(ENSEMBL_SEQUENCE_URL)
+                    .timeout(retry_config.timeout)
                     .send_json(EnsemblSequenceRequestBody { ids })
                     .context("Ensembl sequence request failed")?
                     .into_json()
@@ -55,10 +60,18 @@ fn strip_stop_codon(enst: &str, seq: String, exceptions: &mut ExceptionLog) -> S
     }
 }
 
+/// Fetches Ensembl protein sequences for all `enst_ids`. A batch that still
+/// fails after retries is treated as fatal rather than being dropped: these
+/// are the ENSTs that had no UniProt cross-reference, so a silently missing
+/// sequence here means the corresponding variants are dropped from the
+/// output with no trace. Per-record data-quality issues (wrong molecule
+/// type, trailing stop codon) are not fetch failures and continue to go
+/// through `exceptions` instead.
 pub(crate) fn fetch_ensembl_sequences(
     enst_ids: &[EnsemblId],
     exceptions: &mut ExceptionLog,
-) -> Vec<(EnsemblId, Sequence)> {
+    retry_config: &RetryConfig,
+) -> Result<Vec<(EnsemblId, Sequence)>> {
     let id_strings: Vec<String> = enst_ids
         .iter()
         .map(|id| id.as_str().to_string())
@@ -66,34 +79,26 @@ pub(crate) fn fetch_ensembl_sequences(
     let mut sequences: HashMap<String, Sequence> = HashMap::new();
 
     for chunk in id_strings.chunks(MAX_ENSEMBL_BATCH_SIZE) {
-        match fetch_ensembl_sequence_batch(chunk) {
-            Ok(responses) => {
-                for record in responses {
-                    if record.molecule != "protein" {
-                        exceptions.log(
-                            &record.query,
-                            &format!("expected molecule type 'protein', got '{}'; skipping", record.molecule),
-                        );
-                        continue;
-                    }
-                    let seq = strip_stop_codon(&record.query, record.seq, exceptions);
-                    sequences.insert(record.query, Sequence(seq));
-                }
+        let responses = fetch_ensembl_sequence_batch(chunk, retry_config)?;
+        for record in responses {
+            if record.molecule != "protein" {
+                exceptions.log(
+                    &record.query,
+                    &format!("expected molecule type 'protein', got '{}'; skipping", record.molecule),
+                );
+                continue;
             }
-            Err(e) => {
-                for id in chunk {
-                    exceptions.log(id, &format!("Ensembl sequence batch fetch failed: {:?}", e));
-                }
-            }
+            let seq = strip_stop_codon(&record.query, record.seq, exceptions);
+            sequences.insert(record.query, Sequence(seq));
         }
     }
 
-    enst_ids
+    Ok(enst_ids
         .iter()
         .filter_map(|id| {
             sequences
                 .remove(id.as_str())
                 .map(|seq| (id.clone(), seq))
         })
-        .collect()
+        .collect())
 }

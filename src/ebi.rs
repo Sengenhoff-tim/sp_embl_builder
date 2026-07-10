@@ -3,7 +3,7 @@
 // ============================================================================
 
 use crate::types::{UniprotId, Variant};
-use crate::util::{with_retries, RateLimiter};
+use crate::util::{with_retries, RateLimiter, RetryConfig};
 use anyhow::{anyhow, Context, Result};
 use std::collections::HashMap;
 
@@ -106,12 +106,15 @@ fn build_variation_batch_url(uniprot_ids: &[String], source_types: &[&str]) -> R
 fn fetch_variation_batch(
     uniprot_ids: &[String],
     source_types: &[&str],
+    retry_config: &RetryConfig,
 ) -> Result<Vec<ProteinFeatureInfo>> {
     with_retries(
         &format!("fetching EBI variation for {} accessions", uniprot_ids.len()),
+        retry_config,
         || {
             let url = build_variation_batch_url(uniprot_ids, source_types)?;
             let body = ureq::get(&url)
+                .timeout(retry_config.timeout)
                 .call()
                 .with_context(|| format!("EBI variation request to {} failed", url))?
                 .into_string()
@@ -123,10 +126,16 @@ fn fetch_variation_batch(
     )
 }
 
+/// Fetches EBI variation data for all `uniprot_ids`. A batch that still
+/// fails after retries is treated as fatal rather than being dropped: a
+/// silently missing batch of variants would otherwise pass through as
+/// entries with no variation data, indistinguishable from accessions that
+/// genuinely have none.
 pub(crate) fn fetch_variations(
     uniprot_ids: &[UniprotId],
     source_types: &[&str],
-) -> HashMap<UniprotId, ProteinFeatureInfo> {
+    retry_config: &RetryConfig,
+) -> Result<HashMap<UniprotId, ProteinFeatureInfo>> {
     let id_strings: Vec<String> = uniprot_ids
         .iter()
         .map(|id| id.as_str().to_string())
@@ -136,24 +145,16 @@ pub(crate) fn fetch_variations(
 
     for chunk in id_strings.chunks(MAX_EBI_BATCH_SIZE) {
         rate_limiter.throttle();
-        match fetch_variation_batch(chunk, source_types) {
-            Ok(infos) => {
-                for info in infos {
-                    by_accession.insert(info.accession.clone(), info);
-                }
-            }
-            Err(e) => eprintln!(
-                "Warning: EBI variation batch of {} accessions failed: {:?}",
-                chunk.len(),
-                e
-            ),
+        let infos = fetch_variation_batch(chunk, source_types, retry_config)?;
+        for info in infos {
+            by_accession.insert(info.accession.clone(), info);
         }
     }
 
-    uniprot_ids
+    Ok(uniprot_ids
         .iter()
         .filter_map(|id| by_accession.remove(id.as_str()).map(|info| (id.clone(), info)))
-        .collect()
+        .collect())
 }
 
 // ============================================================================

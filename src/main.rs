@@ -36,17 +36,24 @@ use join::{append_id_tag, join_variants};
 use parsing::{parse_accession_list, parse_variants, resolve_stop_variants};
 use types::{EnsemblId, Isoform, Sequence, UniprotId, Variant};
 use uniprot::{fetch_uniprot_entries, UniProtEntry};
+use util::RetryConfig;
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Write};
 use std::process;
+use std::time::Duration;
 
 fn main() {
     use clap::Parser;
     let args = Cli::parse();
     let source_type_refs: Vec<&str> = args.source_type.iter().map(String::as_str).collect();
+    let retry_config = RetryConfig {
+        timeout: Duration::from_secs(args.timeout_secs),
+        max_attempts: args.max_attempts,
+        backoff_base_ms: args.retry_backoff_ms,
+    };
 
     if let Err(e) = run(
         &args.accessions,
@@ -54,6 +61,7 @@ fn main() {
         args.output.as_deref(),
         &source_type_refs,
         &args.exceptions,
+        &retry_config,
     ) {
         eprintln!("Error: {:?}", e);
         process::exit(1);
@@ -78,6 +86,7 @@ fn run(
     output_path: Option<&str>,
     source_types: &[&str],
     exceptions_path: &str,
+    retry_config: &RetryConfig,
 ) -> Result<()> {
     let mut out: Box<dyn Write> = match output_path {
         Some(path) => Box::new(
@@ -92,7 +101,7 @@ fn run(
     let enst_to_variants = parse_variants(variants_path, &mut exceptions)?;
 
     // 2. Fetch all UniProt entries
-    let uniprot_entries = fetch_uniprot_entries(&accessions);
+    let uniprot_entries = fetch_uniprot_entries(&accessions, retry_config)?;
 
     // 3. Build global ENST→isoform mapping from all entry cross-references
     let mut global_enst_to_isoform: HashMap<EnsemblId, UniprotId> = HashMap::new();
@@ -129,7 +138,7 @@ fn run(
     }
 
     // 6. Fetch EBI variation data for all UniprotIds in one batched pass
-    let rest_variants_by_uniprot = fetch_variations(&all_uniprot_ids, source_types);
+    let rest_variants_by_uniprot = fetch_variations(&all_uniprot_ids, source_types, retry_config)?;
 
     // 7. Process each entry: one flat-file entry per canonical accession — the
     // canonical entry itself, matching a real UniProt flat file (ProtGraph builds
@@ -175,7 +184,7 @@ fn run(
         .collect();
 
     if !unmapped_enst_ids.is_empty() {
-        let enst_sequences = fetch_ensembl_sequences(&unmapped_enst_ids, &mut exceptions);
+        let enst_sequences = fetch_ensembl_sequences(&unmapped_enst_ids, &mut exceptions, retry_config)?;
         for (enst_id, seq) in &enst_sequences {
             let variants = enst_to_variants.get(enst_id).map(Vec::as_slice).unwrap_or(&[]);
             let tagged_variants: Vec<Variant> = variants
