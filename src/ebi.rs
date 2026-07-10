@@ -197,11 +197,25 @@ fn build_variant_id(feature: &EbiFeature) -> String {
     parts.join("|")
 }
 
+/// EBI spells a deletion as the literal text "del" (or, for a nonsense/stop
+/// change, "*") instead of an empty string. Canonicalize it here, at the
+/// source, so the stored value already matches UniProt's own convention (an
+/// empty `replacement` means "Missing") — comparisons and display both then
+/// work off the same plain data, with no special-casing needed downstream.
+fn normalize_deletion_marker(s: String) -> String {
+    if s == "del" || s == "*" {
+        String::new()
+    } else {
+        s
+    }
+}
+
 fn feature_to_variant(feature: &EbiFeature) -> Option<Variant> {
-    let replaced = feature.wild_type.clone()?;
-    let replacement = feature.mutated_type.clone()?;
+    let wild_type = feature.wild_type.clone()?;
     let begin: usize = feature.begin.parse().ok()?;
-    let end = begin + replaced.len().checked_sub(1)?;
+    let end = begin + wild_type.len().checked_sub(1)?;
+    let replaced = normalize_deletion_marker(wild_type);
+    let replacement = normalize_deletion_marker(feature.mutated_type.clone()?);
     let id = build_variant_id(feature);
     Some(Variant { id, begin, end, replaced, replacement, isoform_ref: None })
 }

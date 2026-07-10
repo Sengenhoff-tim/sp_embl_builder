@@ -38,7 +38,7 @@ use types::{EnsemblId, Isoform, Sequence, UniprotId, Variant};
 use uniprot::{fetch_uniprot_entries, UniProtEntry};
 use util::RetryConfig;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Write};
@@ -137,8 +137,19 @@ fn run(
         entry_isoforms.insert(canonical_id.clone(), isoforms);
     }
 
-    // 6. Fetch EBI variation data for all UniprotIds in one batched pass
-    let rest_variants_by_uniprot = fetch_variations(&all_uniprot_ids, source_types, retry_config)?;
+    // 6. Fetch EBI variation data for all UniprotIds in one batched pass —
+    // unless the user passed --source-type None to skip EBI entirely.
+    let skip_ebi = source_types.iter().any(|s| s.eq_ignore_ascii_case("none"));
+    if skip_ebi && source_types.len() > 1 {
+        return Err(anyhow!(
+            "--source-type None must be passed on its own, not combined with other source types"
+        ));
+    }
+    let rest_variants_by_uniprot = if skip_ebi {
+        HashMap::new()
+    } else {
+        fetch_variations(&all_uniprot_ids, source_types, retry_config)?
+    };
 
     // 7. Process each entry: one flat-file entry per canonical accession — the
     // canonical entry itself, matching a real UniProt flat file (ProtGraph builds

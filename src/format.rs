@@ -11,6 +11,14 @@ const FT_INDENT: &str = "FT                   ";
 /// Max characters of content per FT line after the 21-char prefix (79 - 21 = 58).
 const FT_CONTENT_WIDTH: usize = 58;
 
+/// 1-based inclusive `begin..end` slice of `seq`, or `None` if out of range.
+fn residues_at(seq: &str, begin: usize, end: usize) -> Option<String> {
+    if begin == 0 || begin > end || end > seq.len() {
+        return None;
+    }
+    seq.get(begin - 1..end).map(str::to_string)
+}
+
 /// `isoform_ref`, when set, is written as an "ACCESSION:position" cross-reference
 /// instead of a bare position — biopython's feature-location parser (which
 /// ProtGraph is built on) reads that form as a remote reference, routing the
@@ -279,20 +287,37 @@ pub(crate) fn format_entry(
     // retained the residue, so canonical-only variants reach isoforms for free
     // without any remapping here.
     let mut uniprot_variants: HashSet<Variant> = HashSet::new();
+    let mut seen_native_feature_ids: HashSet<&str> = HashSet::new();
     if let Some(e) = entry {
         for feature in e
             .features
             .iter()
             .filter(|f| matches!(f.feature_type.as_str(), "Alternative sequence" | "Natural variant"))
         {
+            // A feature id already seen means UniProt's own JSON repeated the
+            // same feature (has happened for some entries) — render it once.
+            if let Some(id) = feature.feature_id.as_deref().filter(|s| !s.is_empty()) {
+                if !seen_native_feature_ids.insert(id) {
+                    continue;
+                }
+            }
+            let begin = feature.location.start.value;
+            let end = feature.location.end.value;
             uniprot_variants.insert(Variant {
                 id: String::new(),
-                begin: feature.location.start.value,
-                end: feature.location.end.value,
+                begin,
+                end,
+                // UniProt sometimes omits `alternativeSequence` entirely for
+                // older annotations (an empty `{}`, no original residues
+                // recorded at all) even though the position is present. Fall
+                // back to reading the actual residues off the canonical
+                // sequence so this still matches an EBI-sourced record of the
+                // same amino-acid change instead of comparing "" to "V".
                 replaced: feature
                     .alternative_sequence
                     .as_ref()
                     .and_then(|a| a.original_sequence.clone())
+                    .or_else(|| residues_at(sequence.as_str(), begin, end))
                     .unwrap_or_default(),
                 replacement: feature
                     .alternative_sequence
@@ -305,9 +330,17 @@ pub(crate) fn format_entry(
         }
     }
 
-    // Joined variants (EBI + ENST) — skip those already covered by a UniProt feature
+    // Joined variants (EBI + ENST) — skip those already covered by a UniProt
+    // feature, and skip exact repeats within `variants` itself (EBI's
+    // variation feed can list the same amino-acid change twice under
+    // different sourceTypes). Both checks rely purely on position + residue
+    // change (`Variant`'s `Eq`/`Hash`, which normalize "del"/"*" to "" so a
+    // deletion compares equal across sources) — reconciling variants from
+    // different sources is the whole point here, so provenance (ids) plays
+    // no part in the match.
+    let mut seen_joined: HashSet<&Variant> = HashSet::new();
     for variant in variants {
-        if !uniprot_variants.contains(variant) {
+        if !uniprot_variants.contains(variant) && seen_joined.insert(variant) {
             ft_lines.extend(format_ft_from_variant(variant));
         }
     }

@@ -21,7 +21,9 @@ pub(crate) struct Cli {
 
     /// Filter EBI variants by sourceType (comma-separated, up to 2).
     /// Allowed values: uniprot, large scale study, mixed, clinvar, nci-tcga,
-    /// cosmic curated, ensembl, gnomad, topmed, exac
+    /// cosmic curated, ensembl, gnomad, topmed, exac. Pass "None" on its own
+    /// to skip fetching EBI variants entirely (only UniProt/ENST variants are
+    /// used).
     #[arg(long, value_delimiter = ',')]
     pub(crate) source_type: Vec<String>,
 
