@@ -2,64 +2,76 @@
 // Core domain types shared across modules
 // ============================================================================
 
-/// Represents a single amino acid change: residues `begin..=end` (`replaced`) are
-/// swapped for `replacement`. An empty `replacement` means the range is deleted
-/// ("Missing"). Only the affected range is stored, not the full before/after
-/// sequence. `begin`/`end` are in canonical coordinates, unless `isoform_ref` is
-/// set — then they're in that isoform's own coordinates (see below).
-/// `isoform_ref`, when set, is the isoform accession (e.g. "P04637-2") this
-/// variant is specific to. It's written into the FT position field as
-/// "P04637-2:45" rather than a bare "45" — ProtGraph's biopython-based FT parser
-/// reads the "accession:position" form as a remote cross-reference, setting
-/// `location.ref`, which ProtGraph then uses to route the feature onto that
-/// isoform's own vertex chain (tagged `isoform_accession`/`isoform_position` by
-/// its VAR_SEQ reconstruction) instead of the canonical chain. A bare canonical
-/// position instead lands on every chain — canonical's and any isoform's — that
-/// still carries that same position, which is how canonical-only variants reach
-/// isoforms without any remapping on our end.
-/// Equality and Hash deliberately ignore `id` and `isoform_ref` — both are
-/// presentation-only, not part of the variant's identity.
-/// `end = begin + len(replaced) - 1` (single-residue has begin == end).
-#[derive(Debug, Clone)]
-pub(crate) struct Variant {
-    pub(crate) id: String,
-    pub(crate) begin: usize,
-    pub(crate) end: usize,
-    pub(crate) replaced: String,
-    pub(crate) replacement: String,
-    pub(crate) isoform_ref: Option<UniprotId>,
-}
-
-impl PartialEq for Variant {
-    fn eq(&self, other: &Self) -> bool {
-        self.begin == other.begin
-            && self.end == other.end
-            && self.replaced == other.replaced
-            && self.replacement == other.replacement
-    }
-}
-
-impl Eq for Variant {}
-
-impl std::hash::Hash for Variant {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.begin.hash(state);
-        self.end.hash(state);
-        self.replaced.hash(state);
-        self.replacement.hash(state);
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct EnsemblId(pub(crate) String);
 impl EnsemblId {
     pub(crate) fn as_str(&self) -> &str { &self.0 }
 }
 
+impl std::str::FromStr for EnsemblId {
+    type Err = std::convert::Infallible;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.to_string()))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct UniprotId(pub(crate) String);
-impl UniprotId {
-    pub(crate) fn as_str(&self) -> &str { &self.0 }
+pub(crate) enum UniProtId {
+    Id(UniProtCanonId),
+    Iso(UniProtIsoId),
+}
+
+impl UniProtId {
+    pub(crate) fn as_str(&self) -> &str {
+        match self {
+            Self::Id(id) => id.as_str(),
+            Self::Iso(id) => id.as_str(),
+        }
+    }
+}
+
+impl std::str::FromStr for UniProtId {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.contains('-') {
+            Ok(Self::Iso(UniProtIsoId(s.to_string())))
+        } else {
+            Ok(Self::Id(UniProtCanonId(s.to_string())))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Deserialize)]
+pub(crate) struct UniProtCanonId(pub(crate) String);
+
+impl UniProtCanonId {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::str::FromStr for UniProtCanonId {
+    type Err = std::convert::Infallible;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.to_string()))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Deserialize)]
+pub(crate) struct UniProtIsoId(pub(crate) String);
+
+impl UniProtIsoId {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::str::FromStr for UniProtIsoId {
+    type Err = std::convert::Infallible;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.to_string()))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -68,6 +80,13 @@ impl Sequence {
     pub(crate) fn as_str(&self) -> &str { &self.0 }
 }
 
+impl std::str::FromStr for Sequence {
+    type Err = std::convert::Infallible;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.to_string()))
+    }
+}
+
 /// A single UniProt isoform: its full accession (e.g. P31946-2) and reconstructed sequence.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Isoform(pub(crate) UniprotId, pub(crate) Sequence);
+pub(crate) struct Isoform(pub(crate) UniProtIsoId, pub(crate) Sequence);

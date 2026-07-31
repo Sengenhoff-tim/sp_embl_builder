@@ -2,22 +2,32 @@
 // UniProt REST JSON model and fetch
 // ============================================================================
 
-use crate::types::UniprotId;
+use crate::types::{UniProtCanonId, UniProtIsoId, UniProtId, EnsemblId};
 use crate::util::{with_retries, RateLimiter, RetryConfig};
 use anyhow::{Context, Result};
+use clap::builder::Str;
 use std::collections::HashMap;
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UniProtEntry {
+    // Maps JSON "primaryAccession". This is the stable accession UniProt
+    // returns for the entry, used below as the HashMap key when we
+    // reassemble batch results back into per-accession lookups.
     pub(crate) primary_accession: String,
+
     pub(crate) protein_description: Option<ProteinDescription>,
+
     pub(crate) genes: Option<Vec<GeneEntry>>,
+
     pub(crate) sequence: UniProtSequence,
+
     #[serde(default)]
     pub(crate) features: Vec<UniProtFeature>,
+
     #[serde(default)]
     pub(crate) comments: Vec<UniProtComment>,
+
     #[serde(rename = "uniProtKBCrossReferences", default)]
     pub(crate) cross_references: Vec<UniProtCrossReference>,
 }
@@ -37,6 +47,15 @@ impl UniProtEntry {
             .and_then(|g| g.gene_name.as_ref())
             .map(|n| n.value.as_str())
             .unwrap_or("Unknown")
+    }
+
+    /// Returns the isoforms declared across this entry's `ALTERNATIVE
+    /// PRODUCTS` comments
+    pub(crate) fn alternative_product_isoforms(&self) -> impl Iterator<Item = &IsoformInfo> {
+        self.comments
+            .iter()
+            .filter(|c| c.comment_type == "ALTERNATIVE PRODUCTS")
+            .flat_map(|c| c.isoforms.iter())
     }
 }
 
@@ -68,7 +87,7 @@ pub(crate) struct UniProtSequence {
     pub(crate) value: String,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UniProtFeature {
     #[serde(rename = "type")]
@@ -84,18 +103,19 @@ pub(crate) struct UniProtFeature {
     pub(crate) feature_cross_references: Vec<FeatureCrossRef>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub(crate) struct FeatureLocation {
     pub(crate) start: PositionValue,
     pub(crate) end: PositionValue,
+    pub(crate) sequence: Option<String>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub(crate) struct PositionValue {
-    pub(crate) value: usize,
+    pub(crate) value: Option<usize>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AlternativeSequence {
     pub(crate) original_sequence: Option<String>,
@@ -103,21 +123,21 @@ pub(crate) struct AlternativeSequence {
     pub(crate) alternative_sequences: Vec<String>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UniProtEvidence {
     pub(crate) evidence_code: String,
     pub(crate) source: Option<EvidenceSource>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 #[serde(untagged)]
 pub(crate) enum EvidenceSource {
     Full { name: String, id: String },
     NameOnly(String),
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub(crate) struct FeatureCrossRef {
     pub(crate) database: String,
     pub(crate) id: String,
@@ -127,17 +147,44 @@ pub(crate) struct FeatureCrossRef {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UniProtComment {
     pub(crate) comment_type: String,
+
     #[serde(default)]
     pub(crate) isoforms: Vec<IsoformInfo>,
+
     #[serde(default)]
     pub(crate) events: Vec<String>,
+
+    // Nested-object-or-plain-string form of the text, used by
+    // DiseaseComment / CofactorComment / AlternativeProductsComment /
+    // RnaEditingComment (object) and SequenceCautionComment /
+    // WebResourceComment (plain string).
     pub(crate) note: Option<CommentNote>,
+
+    #[serde(default)]
+    pub(crate) texts: Vec<NoteText>,
+}
+
+impl UniProtComment {
+    /// Unified accessor: returns the comment's text
+    pub(crate) fn all_texts(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = self.texts.iter().map(|t| t.value.as_str()).collect();
+        if let Some(note) = &self.note {
+            out.extend(note.texts());
+        }
+        out
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(untagged)]
 pub(crate) enum CommentNote {
+    // DiseaseComment / CofactorComment / AlternativeProductsComment /
+    // RnaEditingComment: note is `{ valid: bool, texts: [...] }`.
     Structured { texts: Vec<NoteText> },
+    // SequenceCautionComment / WebResourceComment: note is a bare string.
+    // This variant must come second: a JSON string would fail to match
+    // `Structured` (which requires an object), and correctly fall through
+    // to here.
     Plain(String),
 }
 
@@ -158,7 +205,8 @@ pub(crate) struct NoteText {
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct IsoformInfo {
-    pub(crate) name: NameValue,
+    pub(crate) name: Option<NameValue>,
+
     #[serde(default)]
     pub(crate) synonyms: Vec<NameValue>,
     #[serde(default)]
@@ -181,12 +229,22 @@ struct UniProtSearchResponse {
     results: Vec<UniProtEntry>,
 }
 
-/// Conservative rate limit — UniProt's published limit is not confirmed in this
-/// environment; lower this if you observe 429 responses.
+
 const UNIPROT_REQUESTS_PER_SECOND: u32 = 50;
-/// Batch size for UniProt stream requests. The stream endpoint handles large OR
-/// queries but very long URLs may be rejected; lower if you see 414 errors.
-const MAX_UNIPROT_BATCH_SIZE: usize = 200;
+
+// Backstop on the number of accessions per batch. UniProt's query parser
+// enforces a hard maximum of 100 `OR` conditions per query (confirmed via
+// their error message: "Too many OR conditions in query. Maximum allowed
+// is 100."), so this must never exceed 100.
+const MAX_UNIPROT_BATCH_SIZE: usize = 100;
+
+// Conservative cap on the *length* of the generated stream URL, kept as
+// a secondary safeguard against pathologically long accession lists
+// (many proxies/load balancers reject URLs above ~8KB).
+const MAX_UNIPROT_URL_LEN: usize = 3000;
+
+const UNIPROT_STREAM_BASE_URL: &str = "https://rest.uniprot.org/uniprotkb/stream?query=";
+const UNIPROT_STREAM_SUFFIX: &str = "&format=json";
 
 fn build_uniprot_stream_url(accessions: &[String]) -> String {
     let query = accessions
@@ -194,10 +252,39 @@ fn build_uniprot_stream_url(accessions: &[String]) -> String {
         .map(|a| format!("accession:{}", a))
         .collect::<Vec<_>>()
         .join("+OR+");
-    format!(
-        "https://rest.uniprot.org/uniprotkb/stream?query={}&format=json",
-        query
-    )
+    format!("{}{}{}", UNIPROT_STREAM_BASE_URL, query, UNIPROT_STREAM_SUFFIX)
+}
+
+/// Splits `accessions` into batches that respect both `MAX_UNIPROT_BATCH_SIZE`
+/// and `MAX_UNIPROT_URL_LEN`, so batches stay safely within UniProt's query
+/// complexity limits and produce reasonably sized URLs.
+fn batch_accessions(accessions: &[String]) -> Vec<Vec<String>> {
+    let fixed_len = UNIPROT_STREAM_BASE_URL.len() + UNIPROT_STREAM_SUFFIX.len();
+    let mut batches: Vec<Vec<String>> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut current_len = fixed_len;
+
+    for accession in accessions {
+        let term_len = "accession:".len() + accession.len();
+        let added_len = term_len + if current.is_empty() { 0 } else { "+OR+".len() };
+
+        let would_exceed_len = current_len + added_len > MAX_UNIPROT_URL_LEN;
+        let would_exceed_count = current.len() >= MAX_UNIPROT_BATCH_SIZE;
+
+        if !current.is_empty() && (would_exceed_len || would_exceed_count) {
+            batches.push(std::mem::take(&mut current));
+            current_len = fixed_len;
+        }
+
+        current_len += term_len + if current.is_empty() { 0 } else { "+OR+".len() };
+        current.push(accession.clone());
+    }
+
+    if !current.is_empty() {
+        batches.push(current);
+    }
+
+    batches
 }
 
 fn fetch_uniprot_batch(accessions: &[String], retry_config: &RetryConfig) -> Result<Vec<UniProtEntry>> {
@@ -222,13 +309,11 @@ fn fetch_uniprot_batch(accessions: &[String], retry_config: &RetryConfig) -> Res
 }
 
 /// Fetches all UniProt entries for `accessions`. A batch that still fails
-/// after retries is treated as fatal rather than being dropped: silently
-/// missing UniProt entries would otherwise surface as confusing downstream
-/// errors (e.g. missing ENST→isoform mappings) far from the real cause.
+/// after retries is treated as fatal to avoid silently missing entries.
 pub(crate) fn fetch_uniprot_entries(
-    accessions: &[UniprotId],
+    accessions: &[UniProtCanonId],
     retry_config: &RetryConfig,
-) -> Result<HashMap<UniprotId, UniProtEntry>> {
+) -> Result<HashMap<UniProtCanonId, UniProtEntry>> {
     let id_strings: Vec<String> = accessions
         .iter()
         .map(|id| id.as_str().to_string())
@@ -236,9 +321,9 @@ pub(crate) fn fetch_uniprot_entries(
     let mut by_accession: HashMap<String, UniProtEntry> = HashMap::new();
     let mut rate_limiter = RateLimiter::per_second(UNIPROT_REQUESTS_PER_SECOND);
 
-    for chunk in id_strings.chunks(MAX_UNIPROT_BATCH_SIZE) {
+    for chunk in batch_accessions(&id_strings) {
         rate_limiter.throttle();
-        let entries = fetch_uniprot_batch(chunk, retry_config)?;
+        let entries = fetch_uniprot_batch(&chunk, retry_config)?;
         for entry in entries {
             by_accession.insert(entry.primary_accession.clone(), entry);
         }
@@ -248,4 +333,18 @@ pub(crate) fn fetch_uniprot_entries(
         .iter()
         .filter_map(|id| by_accession.remove(id.as_str()).map(|e| (id.clone(), e)))
         .collect())
+}
+
+pub(crate) fn get_ensembl_mapping(cross_refernces: &[UniProtCrossReference]) -> Result<Vec<(UniProtId, EnsemblId)>>{
+    let mut result = Vec::new();
+    for cross_ref in cross_refernces {
+        if cross_ref.database == "Ensembl" {
+            if let Some(iso_id) = &cross_ref.isoform_id {
+                let iso_id: UniProtId = iso_id.parse().unwrap();
+                let id: EnsemblId = cross_ref.id.parse().unwrap();
+                result.push((iso_id, id))
+            }
+        }
+    }
+    Ok(result)
 }

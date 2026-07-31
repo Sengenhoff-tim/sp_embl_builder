@@ -2,28 +2,24 @@
 // EBI Proteins API — variation model, fetch, and conversion to Variant
 // ============================================================================
 
-use crate::types::{UniprotId, Variant};
+use crate::types::{UniProtCanonId, UniProtId, UniProtIsoId};
+use crate::variant::Variant;
 use crate::util::{with_retries, RateLimiter, RetryConfig};
 use anyhow::{anyhow, Context, Result};
 use std::collections::HashMap;
 
-// Only fields actually read elsewhere in this module are kept; the EBI response
-// carries plenty more, but serde ignores unmapped JSON keys by default (no
-// `deny_unknown_fields`), so trimming these doesn't affect parsing.
+// Only fields read elsewhere in this module are kept
 #[derive(Debug, Clone, serde::Deserialize)]
 pub(crate) struct ProteinFeatureInfo {
     accession: String,
-    features: Vec<EbiFeature>,
+    pub(crate) features: Vec<EbiFeature>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
-struct EbiFeature {
+pub(crate) struct EbiFeature {
     #[serde(rename = "ftId")]
     ft_id: Option<String>,
     begin: String,
-    xrefs: Option<Vec<EbiDbRef>>,
-    #[serde(default)]
-    evidences: Vec<EbiEvidence>,
     #[serde(rename = "wildType")]
     wild_type: Option<String>,
     #[serde(rename = "mutatedType")]
@@ -126,100 +122,88 @@ fn fetch_variation_batch(
     )
 }
 
-/// Fetches EBI variation data for all `uniprot_ids`. A batch that still
-/// fails after retries is treated as fatal rather than being dropped: a
-/// silently missing batch of variants would otherwise pass through as
-/// entries with no variation data, indistinguishable from accessions that
-/// genuinely have none.
-pub(crate) fn fetch_variations(
-    uniprot_ids: &[UniprotId],
+pub(crate) fn fetch_iso_variations(
+    uniprot_ids: &[UniProtIsoId],
     source_types: &[&str],
     retry_config: &RetryConfig,
-) -> Result<HashMap<UniprotId, ProteinFeatureInfo>> {
-    let id_strings: Vec<String> = uniprot_ids
-        .iter()
-        .map(|id| id.as_str().to_string())
-        .collect();
-    let mut by_accession: HashMap<String, ProteinFeatureInfo> = HashMap::new();
+) -> Result<HashMap<UniProtIsoId, ProteinFeatureInfo>> {
+    let mut result: HashMap<UniProtIsoId, ProteinFeatureInfo> = HashMap::new();
     let mut rate_limiter = RateLimiter::per_second(EBI_MAX_REQUESTS_PER_SECOND);
 
-    for chunk in id_strings.chunks(MAX_EBI_BATCH_SIZE) {
+    for chunk in uniprot_ids.chunks(MAX_EBI_BATCH_SIZE) {
         rate_limiter.throttle();
-        let infos = fetch_variation_batch(chunk, source_types, retry_config)?;
-        for info in infos {
-            by_accession.insert(info.accession.clone(), info);
+        let id_strings: Vec<String> = chunk.iter().map(|id| id.as_str().to_string()).collect();
+        let infos = fetch_variation_batch(&id_strings, source_types, retry_config)?;
+        for (i, info) in infos.into_iter().enumerate() {
+            result.insert(chunk[i].clone(), info);
         }
     }
 
-    Ok(uniprot_ids
-        .iter()
-        .filter_map(|id| by_accession.remove(id.as_str()).map(|info| (id.clone(), info)))
-        .collect())
+    Ok(result)
 }
+
+pub(crate) fn fetch_canon_variations(
+    uniprot_ids: &[UniProtCanonId],
+    source_types: &[&str],
+    retry_config: &RetryConfig,
+) -> Result<HashMap<UniProtCanonId, ProteinFeatureInfo>> {
+    let mut result: HashMap<UniProtCanonId, ProteinFeatureInfo> = HashMap::new();
+    let mut rate_limiter = RateLimiter::per_second(EBI_MAX_REQUESTS_PER_SECOND);
+
+    for chunk in uniprot_ids.chunks(MAX_EBI_BATCH_SIZE) {
+        rate_limiter.throttle();
+        let id_strings: Vec<String> = chunk.iter().map(|id| id.as_str().to_string()).collect();
+        let infos = fetch_variation_batch(&id_strings, source_types, retry_config)?;
+        for (i, info) in infos.into_iter().enumerate() {
+            result.insert(chunk[i].clone(), info);
+        }
+    }
+
+    Ok(result)
+}
+
 
 // ============================================================================
 // Variant building from EBI features
 // ============================================================================
 
-fn format_ebi_evidence_id(evidences: &[EbiEvidence]) -> String {
-    evidences
-        .iter()
-        .map(|e| match &e.source {
-            Some(s) => format!("{}|{}:{}", e.code, s.name, s.id),
-            None => e.code.clone(),
-        })
-        .collect::<Vec<_>>()
-        .join("|")
-}
 
 /// Build the `id` field for a Variant from an EBI feature.
-/// Format: `Uniprot:{ftId}|{xref.name}:{xref.id}|...`
+/// Format: `EBI:{UniProtId}:{position}:{mutatedType}`
 /// Falls back to the evidence string if neither ftId nor xrefs are present.
 fn build_variant_id(feature: &EbiFeature) -> String {
-    let mut parts: Vec<String> = Vec::new();
-
-    if let Some(ft_id) = &feature.ft_id {
-        if !ft_id.is_empty() {
-            parts.push(format!("Uniprot:{}", ft_id));
-        }
-    }
-
-    if let Some(xrefs) = &feature.xrefs {
-        for xref in xrefs {
-            parts.push(format!("{}:{}", xref.name, xref.id));
-        }
-    }
-
-    if parts.is_empty() && !feature.evidences.is_empty() {
-        parts.push(format_ebi_evidence_id(&feature.evidences));
-    }
-
-    parts.join("|")
+    format!(
+        "EBI:{}:{}:{}",
+        feature
+            .ft_id
+            .as_ref()
+            .map(|s| s.as_str())
+            .unwrap_or("unknown"),
+        feature.begin,
+        feature
+            .mutated_type
+            .as_ref()
+            .map(|s| s.as_str())
+            .unwrap_or("unknown")
+    )
 }
 
-/// EBI spells a deletion as the literal text "del" (or, for a nonsense/stop
-/// change, "*") instead of an empty string. Canonicalize it here, at the
-/// source, so the stored value already matches UniProt's own convention (an
-/// empty `replacement` means "Missing") — comparisons and display both then
-/// work off the same plain data, with no special-casing needed downstream.
-fn normalize_deletion_marker(s: String) -> String {
-    if s == "del" || s == "*" {
-        String::new()
-    } else {
-        s
-    }
-}
-
-fn feature_to_variant(feature: &EbiFeature) -> Option<Variant> {
-    let wild_type = feature.wild_type.clone()?;
+pub(crate) fn feature_to_iso_variant(accession: &UniProtIsoId, feature: &EbiFeature) -> Option<Variant> {
+    let replaced = feature.wild_type.clone()?;
+    let replacement = feature.mutated_type.clone()?;
     let begin: usize = feature.begin.parse().ok()?;
-    let end = begin + wild_type.len().checked_sub(1)?;
-    let replaced = normalize_deletion_marker(wild_type);
-    let replacement = normalize_deletion_marker(feature.mutated_type.clone()?);
+    let end = begin + replaced.len().checked_sub(1)?;
     let id = build_variant_id(feature);
-    Some(Variant { id, begin, end, replaced, replacement, isoform_ref: None })
+    let isoform = Some(accession.clone());
+    Some(Variant {isoform, id, begin, end, aa_ref: replaced, aa_new: replacement })
 }
 
-pub(crate) fn variants_from_protein_feature_info(info: &ProteinFeatureInfo) -> Vec<Variant> {
-    info.features.iter().filter_map(feature_to_variant).collect()
+pub(crate) fn feature_to_canon_variant(feature: &EbiFeature) -> Option<Variant> {
+    let replaced = feature.wild_type.clone()?;
+    let replacement = feature.mutated_type.clone()?;
+    let begin: usize = feature.begin.parse().ok()?;
+    let end = begin + replaced.len().checked_sub(1)?;
+    let id = build_variant_id(feature);
+    let isoform = None;
+    Some(Variant {isoform, id, begin, end, aa_ref: replaced, aa_new: replacement })
 }
