@@ -61,7 +61,10 @@ impl Variant {
             let last = seq
                 .chars()
                 .last()
-                .ok_or_else(|| anyhow::anyhow!("cannot resolve stop: sequence is empty"))?
+                .ok_or_else(|| anyhow::anyhow!(
+                    "cannot resolve stop-loss variant {} (aa_ref='*', aa_new='{}'): sequence is empty",
+                    self.id, self.aa_new
+                ))?
                 .to_string();
             let mt = self.aa_new.trim_end_matches('*');
             self.begin = seq.len();
@@ -73,12 +76,23 @@ impl Variant {
                 .begin
                 .checked_add(self.aa_ref.len())
                 .and_then(|n| n.checked_sub(1))
-                .ok_or_else(|| anyhow::anyhow!("invalid begin/aa_ref length combination"))?;
+                .ok_or_else(|| anyhow::anyhow!(
+                    "variant {} has an invalid begin/aa_ref combination (begin={}, aa_ref='{}', len={}): \
+                     computing begin + len(aa_ref) - 1 overflowed",
+                    self.id, self.begin, self.aa_ref, self.aa_ref.len()
+                ))?;
             let suffix = seq.get(suffix_start..).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "suffix_start {} out of bounds for sequence of length {}",
-                    suffix_start,
-                    seq.len()
+                    "variant {} claims residues {}..{} (aa_ref='{}', aa_new='{}'), which extends to \
+                     position {} in the sequence, but the sequence is only {} residues long \
+                     ({} residue(s) too short). This usually means the variant's source (EBI or \
+                     sample data) and the sequence being resolved against (canonical or isoform) \
+                     don't agree on length — e.g. the variant may belong to a different isoform, \
+                     or the UniProt sequence has since been updated.",
+                    self.id, self.begin, self.begin + self.aa_ref.len().saturating_sub(1),
+                    self.aa_ref, self.aa_new,
+                    suffix_start, seq.len(),
+                    suffix_start.saturating_sub(seq.len()).max(1)
                 )
             })?;
             self.end = seq.len();
@@ -104,4 +118,3 @@ impl JoinVariants for Vec<Variant> {
         }
     }
 }
-

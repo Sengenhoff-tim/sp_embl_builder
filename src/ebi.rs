@@ -6,6 +6,14 @@ use crate::types::{UniProtCanonId, UniProtId, UniProtIsoId};
 use crate::variant::Variant;
 use crate::util::{with_retries, RateLimiter, RetryConfig};
 use anyhow::{anyhow, Context, Result};
+use futures::stream::{self, StreamExt};
+
+/// Caps the number of EBI batch requests in flight at once, for the same
+/// reason as `MAX_CONCURRENT_UNIPROT_REQUESTS` in `uniprot.rs`: the rate
+/// limiter only paces how fast requests are *admitted*, not how many stay
+/// open concurrently, so an unbounded pile-up of in-flight requests can
+/// still cause individual ones to time out.
+const MAX_CONCURRENT_EBI_REQUESTS: usize = 10;
 use std::collections::HashMap;
 
 // Only fields read elsewhere in this module are kept
@@ -39,7 +47,7 @@ struct EbiEvidence {
 }
 
 const MAX_EBI_BATCH_SIZE: usize = 100;
-const EBI_MAX_REQUESTS_PER_SECOND: u32 = 200;
+pub(crate) const EBI_MAX_REQUESTS_PER_SECOND: u32 = 200;
 
 const ALLOWED_SOURCE_TYPES: [&str; 10] = [
     "uniprot",
@@ -99,67 +107,108 @@ fn build_variation_batch_url(uniprot_ids: &[String], source_types: &[&str]) -> R
     Ok(url)
 }
 
-fn fetch_variation_batch(
+async fn fetch_variation_batch(
     uniprot_ids: &[String],
     source_types: &[&str],
     retry_config: &RetryConfig,
+    client: &reqwest::Client,
 ) -> Result<Vec<ProteinFeatureInfo>> {
     with_retries(
         &format!("fetching EBI variation for {} accessions", uniprot_ids.len()),
         retry_config,
-        || {
+        || async {
             let url = build_variation_batch_url(uniprot_ids, source_types)?;
-            let body = ureq::get(&url)
+            let response = client
+                .get(&url)
                 .timeout(retry_config.timeout)
-                .call()
-                .with_context(|| format!("EBI variation request to {} failed", url))?
-                .into_string()
+                .send()
+                .await
+                .with_context(|| format!("EBI variation request to {} failed", url))?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                return Err(anyhow!("EBI variation request failed: HTTP {}: {}", status, body));
+            }
+
+            let body = response
+                .text()
+                .await
                 .context("failed to read EBI variation response body")?;
             let info: Vec<ProteinFeatureInfo> = serde_json::from_str(&body)
                 .context("failed to parse EBI variation response as JSON")?;
             Ok(info)
         },
     )
+    .await
 }
 
-pub(crate) fn fetch_iso_variations(
+/// Shared implementation for `fetch_iso_variations`/`fetch_canon_variations`:
+/// batches `keys`, fetches all batches concurrently, and enforces a single
+/// global `EBI_MAX_REQUESTS_PER_SECOND` cap shared across every in-flight
+/// batch via one `RateLimiter` cloned into each task.
+async fn fetch_variations_generic<K>(
+    keys: &[K],
+    as_str: impl Fn(&K) -> String,
+    source_types: &[&str],
+    retry_config: &RetryConfig,
+    rate_limiter: &RateLimiter,
+    client: &reqwest::Client,
+) -> Result<HashMap<K, ProteinFeatureInfo>>
+where
+    K: Clone + Eq + std::hash::Hash,
+{
+    let mut result: HashMap<K, ProteinFeatureInfo> = HashMap::new();
+
+    let source_types_owned: Vec<String> = source_types.iter().map(|s| s.to_string()).collect();
+
+    let chunks: Vec<Vec<K>> = keys.chunks(MAX_EBI_BATCH_SIZE).map(|c| c.to_vec()).collect();
+
+    let mut results = stream::iter(chunks)
+        .map(|chunk_keys| {
+            let id_strings: Vec<String> = chunk_keys.iter().map(&as_str).collect();
+            let rate_limiter = rate_limiter.clone();
+            let retry_config = *retry_config;
+            let client = client.clone();
+            let source_types_owned = source_types_owned.clone();
+
+            async move {
+                rate_limiter.throttle().await;
+                let source_type_refs: Vec<&str> = source_types_owned.iter().map(String::as_str).collect();
+                let infos = fetch_variation_batch(&id_strings, &source_type_refs, &retry_config, &client).await?;
+                Ok::<_, anyhow::Error>((chunk_keys, infos))
+            }
+        })
+        .buffer_unordered(MAX_CONCURRENT_EBI_REQUESTS);
+
+    while let Some(res) = results.next().await {
+        let (chunk_keys, infos) = res?;
+        for (i, info) in infos.into_iter().enumerate() {
+            result.insert(chunk_keys[i].clone(), info);
+        }
+    }
+
+    Ok(result)
+}
+
+pub(crate) async fn fetch_iso_variations(
     uniprot_ids: &[UniProtIsoId],
     source_types: &[&str],
     retry_config: &RetryConfig,
+    rate_limiter: &RateLimiter,
+    client: &reqwest::Client,
 ) -> Result<HashMap<UniProtIsoId, ProteinFeatureInfo>> {
-    let mut result: HashMap<UniProtIsoId, ProteinFeatureInfo> = HashMap::new();
-    let mut rate_limiter = RateLimiter::per_second(EBI_MAX_REQUESTS_PER_SECOND);
-
-    for chunk in uniprot_ids.chunks(MAX_EBI_BATCH_SIZE) {
-        rate_limiter.throttle();
-        let id_strings: Vec<String> = chunk.iter().map(|id| id.as_str().to_string()).collect();
-        let infos = fetch_variation_batch(&id_strings, source_types, retry_config)?;
-        for (i, info) in infos.into_iter().enumerate() {
-            result.insert(chunk[i].clone(), info);
-        }
-    }
-
-    Ok(result)
+    fetch_variations_generic(uniprot_ids, |id| id.as_str().to_string(), source_types, retry_config, rate_limiter, client).await
 }
 
-pub(crate) fn fetch_canon_variations(
+pub(crate) async fn fetch_canon_variations(
     uniprot_ids: &[UniProtCanonId],
     source_types: &[&str],
     retry_config: &RetryConfig,
+    rate_limiter: &RateLimiter,
+    client: &reqwest::Client,
 ) -> Result<HashMap<UniProtCanonId, ProteinFeatureInfo>> {
-    let mut result: HashMap<UniProtCanonId, ProteinFeatureInfo> = HashMap::new();
-    let mut rate_limiter = RateLimiter::per_second(EBI_MAX_REQUESTS_PER_SECOND);
-
-    for chunk in uniprot_ids.chunks(MAX_EBI_BATCH_SIZE) {
-        rate_limiter.throttle();
-        let id_strings: Vec<String> = chunk.iter().map(|id| id.as_str().to_string()).collect();
-        let infos = fetch_variation_batch(&id_strings, source_types, retry_config)?;
-        for (i, info) in infos.into_iter().enumerate() {
-            result.insert(chunk[i].clone(), info);
-        }
-    }
-
-    Ok(result)
+    fetch_variations_generic(uniprot_ids, |id| id.as_str().to_string(), source_types, retry_config, rate_limiter, client).await
 }
 
 
