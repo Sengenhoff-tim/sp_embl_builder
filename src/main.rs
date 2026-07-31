@@ -315,7 +315,7 @@ async fn run(
         global_assinged_enst.extend(assigned_enst);
 
         completed += 1;
-        eprint!("\rProcessed entry {}/{}: {}", completed, total_entries, canonical_id.as_str());
+        eprint!("\rProcessed entry {}/{}: {}\n", completed, total_entries, canonical_id.as_str());
         io::stderr().flush().ok();
     }
     eprintln!();

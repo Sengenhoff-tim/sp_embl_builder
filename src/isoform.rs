@@ -122,38 +122,33 @@ fn reconstruct_isoform(
     status: &str,
     sequence_ids: &[String],
     vsp_features: &[UniProtFeature],
-) -> Result<(UniProtIsoId, Sequence)> {
-    match status {
-        "Described" => {
-            let features: Vec<&UniProtFeature> = sequence_ids
-                .iter()
-                .filter_map(|id| {
-                    vsp_features
-                        .iter()
-                        .find(|f| f.feature_id.as_deref() == Some(id.as_str()))
-                })
-                .collect();
+) -> Result<Option<(UniProtIsoId, Sequence)>> {
+    if status == "Described"{
+        let features: Vec<&UniProtFeature> = sequence_ids
+            .iter()
+            .filter_map(|id| {
+                vsp_features
+                    .iter()
+                    .find(|f| f.feature_id.as_deref() == Some(id.as_str()))
+            })
+            .collect();
 
-            if features.len() != sequence_ids.len() {
-                return Err(anyhow!(
-                    "isoform {} references {} VSP IDs but only {} found",
-                    isoform_id.as_str(),
-                    sequence_ids.len(),
-                    features.len()
-                ));
-            }
-
-            let seq = apply_var_seq_features(&entry.sequence.value, &features)
-                .with_context(|| format!("failed to reconstruct isoform {}", isoform_id.as_str()))?;
-
-            Ok((isoform_id, Sequence(seq)))
+        if features.len() != sequence_ids.len() {
+            return Err(anyhow!(
+                "isoform {} references {} VSP IDs but only {} found",
+                isoform_id.as_str(),
+                sequence_ids.len(),
+                features.len()
+            ));
         }
-        "Not described" => Err(anyhow!("isoform {} is 'Not described'", isoform_id.as_str())),
-        other => Err(anyhow!(
-            "unknown isoform status '{}' for {}",
-            other,
-            isoform_id.as_str()
-        )),
+
+        let seq = apply_var_seq_features(&entry.sequence.value, &features)
+            .with_context(|| format!("failed to reconstruct isoform {}", isoform_id.as_str()))?;
+
+        Ok(Some((isoform_id, Sequence(seq))))
+    }
+    else {
+        Ok(None)
     }
 }
 
@@ -227,15 +222,17 @@ pub(crate) fn collect_and_reconstruct_isoforms(
             let isoform_id = isoform_id
                 .ok_or_else(|| anyhow!("isoform entry has no isoform id"))?;
 
-            let isoform = reconstruct_isoform(
+            if let Some(isoform) = reconstruct_isoform(
                 entry,
                 isoform_id,
                 iso.isoform_sequence_status.as_deref().unwrap_or(""),
                 &iso.sequence_ids,
                 &var_seq_features,
-            )?;
-
-            isoforms.insert(isoform.0, isoform.1);
+            )? {
+                isoforms.insert(isoform.0, isoform.1);
+            }
+            //TODO ELSE
+            
         }
     }
 

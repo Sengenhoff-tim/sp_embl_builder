@@ -26,6 +26,14 @@ struct EnsemblSequenceResponse {
     response_id: String,
 }
 
+fn strip_version(ensembl_id: &str) -> String {
+    ensembl_id
+        .split('.')
+        .next()
+        .unwrap_or(ensembl_id)
+        .to_string()
+}
+
 async fn fetch_ensembl_sequence_batch(
     ids: &[String],
     retry_config: &RetryConfig,
@@ -91,7 +99,7 @@ pub(crate) async fn fetch_ensembl_sequences(
 ) -> Result<Vec<(EnsemblId, Sequence)>> {
     let id_strings: Vec<String> = enst_ids
         .iter()
-        .map(|id| id.as_str().to_string())
+        .map(|id| strip_version(id.as_str()))
         .collect();
     let mut sequences: HashMap<String, Sequence> = HashMap::new();
     let client = reqwest::Client::new();
@@ -115,7 +123,7 @@ pub(crate) async fn fetch_ensembl_sequences(
         .iter()
         .filter_map(|id| {
             sequences
-                .remove(id.as_str())
+                .remove(&strip_version(id.as_str()))
                 .map(|seq| (id.clone(), seq))
         })
         .collect())
