@@ -179,13 +179,17 @@ pub(crate) fn collect_and_reconstruct_isoforms(
             var_seq_features.push(f.clone());
         } 
         else if f.feature_type == "Natural variant" {
-            if let Some(begin) = f.location.start.value {
+            if let Some(begin) = f.location.start.value
+                && let Some(alt_seq) = f.alternative_sequence.as_ref(){
                 let mut iso_id: Option<UniProtIsoId> = None;
                 if let Some(iso_ref) = &f.location.sequence {
                     iso_id =Some(iso_ref.to_string().parse().unwrap());
                 }
-                let aa_ref = f.alternative_sequence.as_ref().unwrap().original_sequence.as_ref().unwrap().clone();
+                
                 let end = f.location.end.value.unwrap_or(begin);
+                let aa_ref = 
+                    alt_seq.original_sequence.clone().unwrap_or(String::new());
+                let aa_new = alt_seq.alternative_sequences.first().cloned().unwrap_or(String::new());
                 uniprot_variants.push(
                     Variant {
                         isoform: iso_id,
@@ -193,7 +197,7 @@ pub(crate) fn collect_and_reconstruct_isoforms(
                         begin: begin,
                         end: end,
                         aa_ref: aa_ref,
-                        aa_new: f.alternative_sequence.as_ref().unwrap().alternative_sequences.first().cloned().unwrap_or_else(String::new),
+                        aa_new: aa_new,
                     }
                 );
             }
