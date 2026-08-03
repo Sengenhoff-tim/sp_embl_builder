@@ -4,3 +4,4 @@
 target/
 /test.txt
 /exceptions.log
+.git-rewrite
