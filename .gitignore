@@ -2,3 +2,5 @@
 /Cargo.lock
 /empty.txt
 target/
+/test.txt
+/exceptions.log
