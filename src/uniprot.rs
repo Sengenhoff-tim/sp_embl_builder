@@ -173,7 +173,7 @@ pub(crate) struct UniProtComment {
     #[serde(default)]
     pub(crate) texts: Vec<NoteText>,
 }
-
+/* 
 impl UniProtComment {
     /// Unified accessor: returns the comment's text
     pub(crate) fn all_texts(&self) -> Vec<&str> {
@@ -184,6 +184,7 @@ impl UniProtComment {
         out
     }
 }
+    */
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(untagged)]

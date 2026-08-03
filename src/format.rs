@@ -151,11 +151,13 @@ fn format_ft_from_uniprot_var_seq(feature: &UniProtFeature) -> Option<Vec<String
 fn format_variant(variant: &Variant) -> Vec<String> {
     let mut lines = Vec::new();
     lines.push(format_ft_position_line("VARIANT", &variant.isoform, variant.begin, variant.end));
-    let note = if variant.aa_new.is_empty() {
-        "Missing".to_string()
-    } else {
-        format!("{} -> {}", variant.aa_ref, variant.aa_new)
-    };
+    let note = if let Some(aa_new) = &variant.aa_new
+        && let Some(aa_ref) = &variant.aa_ref
+        {
+            format!("{} -> {}", aa_ref, aa_new)
+        } else {
+            "Missing".to_string()
+        };
     lines.extend(wrap_ft_qualifier("note", &note));
     lines.extend(wrap_ft_qualifier("id", &variant.id));
     lines

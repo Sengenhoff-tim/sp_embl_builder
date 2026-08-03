@@ -5,12 +5,12 @@
 // see main.rs)
 // ============================================================================
 
-use crate::types::{EnsemblId, Isoform, Sequence, UniProtIsoId, UniProtCanonId};
+use crate::types::{Sequence, UniProtIsoId};
 use crate::variant::Variant;
 use crate::uniprot::{UniProtEntry, UniProtFeature};
-use anyhow::{anyhow, Result, Context};
+use anyhow::{anyhow, Result};
 use std::collections::HashMap;
-
+/* 
 pub(crate) fn collect_isoform_ids(
     entry: &UniProtEntry,
     canonical_id: &UniProtCanonId,
@@ -36,21 +36,7 @@ pub(crate) fn collect_isoform_ids(
 
     (displayed_id, isoform_map)
 }
-
-/* 
-    // Redirect Displayed-isoform aliases to the canonical id.
-    let mapping = mapping
-        .into_iter()
-        .map(|(enst, target)| {
-            let target = if Some(&target) == displayed_id.as_ref() {
-                canonical_id.clone()
-            } else {
-                target
-            };
-            (enst, target)
-        })
-        .collect();
-*/
+    */
 
 /// Apply a set of VAR_SEQ features to the canonical sequence to produce an
 /// isoform sequence. Features must be applied in descending position order
@@ -113,58 +99,174 @@ fn apply_var_seq_features(canonical: &str, features: &[&UniProtFeature]) -> Resu
     Ok(seq)
 }
 
-/// Reconstruct a single "Described" isoform's sequence from its VAR_SEQ
-/// features. Returns an error for any other status ("Not described",
-/// unknown, etc.).
+/// Reconstruct a single isoform's sequence from its VAR_SEQ features.
+///
+/// Returns `None` (logging a infoing via `tracing::info!`) instead of
+/// failing outright for any condition that means *this specific isoform*
+/// can't be reconstructed: an unsupported/unknown status ("Not described",
+/// "External", or anything else besides "Described"), a mismatch between
+/// the declared VSP ids and the features actually found, or a failure
+/// while applying the VAR_SEQ features themselves (out-of-range position,
+/// original-sequence mismatch, etc). None of these should abort processing
+/// of the rest of the entry — they mean one isoform is skipped, nothing
+/// more.
 fn reconstruct_isoform(
     entry: &UniProtEntry,
     isoform_id: UniProtIsoId,
     status: &str,
     sequence_ids: &[String],
     vsp_features: &[UniProtFeature],
-) -> Result<Option<(UniProtIsoId, Sequence)>> {
-    if status == "Described"{
-        let features: Vec<&UniProtFeature> = sequence_ids
-            .iter()
-            .filter_map(|id| {
-                vsp_features
-                    .iter()
-                    .find(|f| f.feature_id.as_deref() == Some(id.as_str()))
-            })
-            .collect();
+) -> Option<(UniProtIsoId, Sequence)> {
+    match status {
+        "Described" => {
+            let features: Vec<&UniProtFeature> = sequence_ids
+                .iter()
+                .filter_map(|id| {
+                    vsp_features
+                        .iter()
+                        .find(|f| f.feature_id.as_deref() == Some(id.as_str()))
+                })
+                .collect();
 
-        if features.len() != sequence_ids.len() {
-            return Err(anyhow!(
-                "isoform {} references {} VSP IDs but only {} found",
-                isoform_id.as_str(),
-                sequence_ids.len(),
-                features.len()
-            ));
+            if features.len() != sequence_ids.len() {
+                tracing::info!(
+                    "{},{},isoform references {} VSP id(s) but only {} were found among this entry's 'Alternative sequence' features; skipping isoform",
+                    entry.primary_accession,
+                    isoform_id.as_str(),
+                    sequence_ids.len(),
+                    features.len()
+                );
+                return None;
+            }
+
+            match apply_var_seq_features(&entry.sequence.value, &features) {
+                Ok(seq) => Some((isoform_id, Sequence(seq))),
+                Err(e) => {
+                    tracing::info!(
+                        "{},{},failed to reconstruct isoform: {:?}; skipping isoform",
+                        entry.primary_accession,
+                        isoform_id.as_str(),
+                        e
+                    );
+                    None
+                }
+            }
         }
-
-        let seq = apply_var_seq_features(&entry.sequence.value, &features)
-            .with_context(|| format!("failed to reconstruct isoform {}", isoform_id.as_str()))?;
-
-        Ok(Some((isoform_id, Sequence(seq))))
-    }
-    else {
-        Ok(None)
+        "Not described" => {
+        tracing::info!(
+            "{},{},isoform sequence status is 'Not described' (no VAR_SEQ features to apply); skipping isoform",
+            entry.primary_accession,
+            isoform_id.as_str()
+        );
+        None
+        }
+        other => {
+            tracing::info!(
+                "{},{},unknown/unsupported isoform sequence status '{}'; skipping isoform",
+                entry.primary_accession,
+                isoform_id.as_str(),
+                other
+            );
+            None
+        }
     }
 }
 
+fn resolve_isoform_reference(
+    iso_ref: &Option<String>
+) -> Option<UniProtIsoId>{
+    let mut iso_id: Option<UniProtIsoId> = None;
+        
+    if let Some(iso) = iso_ref{
+        //infallible unwrap for conversion
+        iso_id =Some(iso.to_string().parse().unwrap());
+    }
+    iso_id
+}
+
+fn add_canonical_variant(
+    accession: &String,
+    feature: &UniProtFeature,
+    uniprot_variants: &mut Vec<Variant>
+) {
+    let isoform_id = feature.feature_id.clone().unwrap_or(
+        feature.description.clone().unwrap_or("No Identifier or Description".to_string())
+    );
+
+    // position is required
+    if let Some(begin) = feature.location.start.value {
+        
+        
+        let iso_id = resolve_isoform_reference(&feature.location.sequence);
+
+        // end defaults to begin if not set
+        let end = feature.location.end.value.unwrap_or(begin);
+
+        // ref == None and new == None: Missing sequence
+        let mut aa_ref = None;
+        let mut aa_new = None;
+
+        if let Some(aa_seq) = feature.alternative_sequence.as_ref() {
+            let aa_new_vec = &aa_seq.alternative_sequences;
+
+            // if AlternativeSequence is set, original sequence and alternative sequence must have distinct values
+            if let Some(original) = &aa_seq.original_sequence && aa_new_vec.len() > 0 {
+                if aa_new_vec.len() > 1 {
+                    tracing::info!(
+                        "{},Variant [{}] cannot be mapped: Alternative sequence is ambiguous",
+                        accession,
+                        isoform_id
+                    );     
+                    return;
+                }
+
+                //unwrap safe because of len() check
+                aa_new = Some(aa_new_vec.first().cloned().unwrap());
+
+                aa_ref = Some(original);
+            }
+        } else {
+            tracing::info!(
+                "{},Variant [{}] cannot be mapped: Malformed format",
+                accession,
+                isoform_id
+            );     
+            return;
+        }
+        uniprot_variants.push(
+            Variant {
+                isoform: iso_id,
+                id: feature.feature_id.clone().unwrap_or(String::new()),
+                begin: begin,
+                end: end,
+                aa_ref: aa_ref.cloned(),
+                aa_new: aa_new,
+            }
+        );
+    }
+    else {
+        tracing::info!(
+            "{},Variant [{}] cannot be mapped: No position",
+                accession,
+                isoform_id
+            )
+    }
+}
 /// Collect isoform IDs, reconstruct their sequences, and collect VAR_SEQ
 /// features, in a single pass over the ALTERNATIVE PRODUCTS comment(s).
 ///
-/// Returns `(displayed_id, isoform_map, vsp_features)` where `isoform_map`
-/// maps the canonical id to the list of reconstructed isoforms (each of
-/// which already carries its own `UniProtIsoId`).
+/// Returns `(displayed_id, isoform_map, vsp_features, uniprot_variants)`
+/// where `isoform_map` maps the canonical id to the list of reconstructed
+/// isoforms (each of which already carries its own `UniProtIsoId`). Any
+/// isoform that can't be reconstructed is skipped and logged via
+/// `tracing::info!` rather than failing the whole entry.
 pub(crate) fn collect_and_reconstruct_isoforms(
     entry: &UniProtEntry
 ) -> Result<(
     Option<UniProtIsoId>,
     HashMap<UniProtIsoId, Sequence>,
     Vec<UniProtFeature>,
-    Vec<Variant>
+    Vec<Variant>,
 )> {
     let mut var_seq_features: Vec<UniProtFeature> = Vec::new();
     let mut uniprot_variants: Vec<Variant> = Vec::new();
@@ -174,28 +276,7 @@ pub(crate) fn collect_and_reconstruct_isoforms(
             var_seq_features.push(f.clone());
         } 
         else if f.feature_type == "Natural variant" {
-            if let Some(begin) = f.location.start.value
-                && let Some(alt_seq) = f.alternative_sequence.as_ref(){
-                let mut iso_id: Option<UniProtIsoId> = None;
-                if let Some(iso_ref) = &f.location.sequence {
-                    iso_id =Some(iso_ref.to_string().parse().unwrap());
-                }
-                
-                let end = f.location.end.value.unwrap_or(begin);
-                let aa_ref = 
-                    alt_seq.original_sequence.clone().unwrap_or(String::new());
-                let aa_new = alt_seq.alternative_sequences.first().cloned().unwrap_or(String::new());
-                uniprot_variants.push(
-                    Variant {
-                        isoform: iso_id,
-                        id: f.feature_id.clone().unwrap_or(String::new()),
-                        begin: begin,
-                        end: end,
-                        aa_ref: aa_ref,
-                        aa_new: aa_new,
-                    }
-                );
-            }
+            add_canonical_variant(&entry.primary_accession, f, &mut uniprot_variants);
         }
     }
 
@@ -219,20 +300,23 @@ pub(crate) fn collect_and_reconstruct_isoforms(
                 continue;
             }
 
-            let isoform_id = isoform_id
-                .ok_or_else(|| anyhow!("isoform entry has no isoform id"))?;
+            let isoform_id = match isoform_id {
+                Some(id) => id,
+                None => {
+                    tracing::info!("isoform entry has no isoform id; skipping isoform");
+                    continue;
+                }
+            };
 
-            if let Some(isoform) = reconstruct_isoform(
+            if let Some((id, seq)) = reconstruct_isoform(
                 entry,
                 isoform_id,
                 iso.isoform_sequence_status.as_deref().unwrap_or(""),
                 &iso.sequence_ids,
                 &var_seq_features,
-            )? {
-                isoforms.insert(isoform.0, isoform.1);
+            ) {
+                isoforms.insert(id, seq);
             }
-            //TODO ELSE
-            
         }
     }
 

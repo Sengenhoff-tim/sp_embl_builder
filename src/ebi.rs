@@ -2,24 +2,19 @@
 // EBI Proteins API — variation model, fetch, and conversion to Variant
 // ============================================================================
 
-use crate::types::{UniProtCanonId, UniProtId, UniProtIsoId};
+use crate::types::{UniProtCanonId, UniProtIsoId};
 use crate::variant::Variant;
 use crate::util::{with_retries, RateLimiter, RetryConfig};
 use anyhow::{anyhow, Context, Result};
 use futures::stream::{self, StreamExt};
+use tracing::info;
 
-/// Caps the number of EBI batch requests in flight at once, for the same
-/// reason as `MAX_CONCURRENT_UNIPROT_REQUESTS` in `uniprot.rs`: the rate
-/// limiter only paces how fast requests are *admitted*, not how many stay
-/// open concurrently, so an unbounded pile-up of in-flight requests can
-/// still cause individual ones to time out.
 const MAX_CONCURRENT_EBI_REQUESTS: usize = 10;
 use std::collections::HashMap;
 
 // Only fields read elsewhere in this module are kept
 #[derive(Debug, Clone, serde::Deserialize)]
 pub(crate) struct ProteinFeatureInfo {
-    accession: String,
     pub(crate) features: Vec<EbiFeature>,
 }
 
@@ -32,18 +27,6 @@ pub(crate) struct EbiFeature {
     wild_type: Option<String>,
     #[serde(rename = "mutatedType")]
     mutated_type: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-struct EbiDbRef {
-    name: String,
-    id: String,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-struct EbiEvidence {
-    code: String,
-    source: Option<EbiDbRef>,
 }
 
 const MAX_EBI_BATCH_SIZE: usize = 100;
@@ -143,10 +126,6 @@ async fn fetch_variation_batch(
     .await
 }
 
-/// Shared implementation for `fetch_iso_variations`/`fetch_canon_variations`:
-/// batches `keys`, fetches all batches concurrently, and enforces a single
-/// global `EBI_MAX_REQUESTS_PER_SECOND` cap shared across every in-flight
-/// batch via one `RateLimiter` cloned into each task.
 async fn fetch_variations_generic<K>(
     keys: &[K],
     as_str: impl Fn(&K) -> String,
@@ -163,6 +142,12 @@ where
     let source_types_owned: Vec<String> = source_types.iter().map(|s| s.to_string()).collect();
 
     let chunks: Vec<Vec<K>> = keys.chunks(MAX_EBI_BATCH_SIZE).map(|c| c.to_vec()).collect();
+    
+    tracing::info!(
+        chunk_count = chunks.len(),
+        batch_size = MAX_EBI_BATCH_SIZE,
+        "Starting batch processing"
+    );
 
     let mut results = stream::iter(chunks)
         .map(|chunk_keys| {
@@ -175,7 +160,20 @@ where
             async move {
                 rate_limiter.throttle().await;
                 let source_type_refs: Vec<&str> = source_types_owned.iter().map(String::as_str).collect();
+                
+                tracing::info!(
+                    id_count = id_strings.len(),
+                    source_types = ?source_type_refs,
+                    "Fetching variation batch"
+                );
+                
                 let infos = fetch_variation_batch(&id_strings, &source_type_refs, &retry_config, &client).await?;
+                
+                tracing::info!(
+                    fetched_count = infos.len(),
+                    "Batch fetch completed"
+                );
+                
                 Ok::<_, anyhow::Error>((chunk_keys, infos))
             }
         })
@@ -188,8 +186,14 @@ where
         }
     }
 
+    tracing::info!(
+        total_results = result.len(),
+        "Batch processing completed"
+    );
+
     Ok(result)
 }
+
 
 pub(crate) async fn fetch_iso_variations(
     uniprot_ids: &[UniProtIsoId],
@@ -238,21 +242,25 @@ fn build_variant_id(feature: &EbiFeature) -> String {
 }
 
 pub(crate) fn feature_to_iso_variant(accession: &UniProtIsoId, feature: &EbiFeature) -> Option<Variant> {
-    let replaced = feature.wild_type.clone()?;
-    let replacement = feature.mutated_type.clone()?;
-    let begin: usize = feature.begin.parse().ok()?;
-    let end = begin + replaced.len().checked_sub(1)?;
-    let id = build_variant_id(feature);
-    let isoform = Some(accession.clone());
-    Some(Variant {isoform, id, begin, end, aa_ref: replaced, aa_new: replacement })
+    if let Some(replaced) = &feature.wild_type {
+        let begin: usize = feature.begin.parse().ok()?;
+        let end = begin + replaced.len().checked_sub(1)?;
+        let id = "EBI".to_string();
+        let isoform = Some(accession.clone());
+        return Some(Variant {isoform, id, begin, end, aa_ref: Some(replaced.to_string()), aa_new: feature.mutated_type.clone() })
+    }
+    info!("{},Variant at [{}] replaces ambigues sequence", accession.as_str(), feature.begin);
+    None
 }
 
-pub(crate) fn feature_to_canon_variant(feature: &EbiFeature) -> Option<Variant> {
-    let replaced = feature.wild_type.clone()?;
-    let replacement = feature.mutated_type.clone()?;
-    let begin: usize = feature.begin.parse().ok()?;
-    let end = begin + replaced.len().checked_sub(1)?;
-    let id = build_variant_id(feature);
-    let isoform = None;
-    Some(Variant {isoform, id, begin, end, aa_ref: replaced, aa_new: replacement })
+pub(crate) fn feature_to_canon_variant(accession: &str, feature: &EbiFeature) -> Option<Variant> {
+    if let Some(replaced) = &feature.wild_type {
+        let begin: usize = feature.begin.parse().ok()?;
+        let end = begin + replaced.len().checked_sub(1)?;
+        let id = "EBI".to_string();
+        let isoform = None;
+        return Some(Variant {isoform, id, begin, end, aa_ref: Some(replaced.to_string()), aa_new: feature.mutated_type.clone() })
+    }
+    info!("{},Variant at [{}] replaces ambigues sequence", accession, feature.begin);
+    None
 }

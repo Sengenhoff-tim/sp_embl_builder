@@ -2,11 +2,10 @@
 // Parsing of the accession list and ENST variant input files
 // ============================================================================
 
-use crate::exceptions::ExceptionLog;
 use crate::types::{EnsemblId, UniProtCanonId};
 use crate::variant::Variant;
-use crate::util::strip_version;
 use anyhow::{Context, Result};
+use tracing::info;
 use std::collections::HashMap;
 use std::fs;
 
@@ -56,15 +55,14 @@ fn to_variant(id: &str, variant_str: &str) -> Option<Variant> {
         id: id.to_string(),
         begin,
         end,
-        aa_ref: raw_wt.to_string(),
-        aa_new: raw_mt.to_string(),
+        aa_ref: Some(raw_wt.to_string()),
+        aa_new: Some(raw_mt.to_string()),
     })
 }
 
 /// parse a ensembl transcript mapped variant input file, returning a map of Ensembl-ID → list of variants.
 pub(crate) fn parse_sample_variants(
     path: &str,
-    exceptions: &mut ExceptionLog,
 ) -> Result<HashMap<EnsemblId, Vec<Variant>>> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to read variants file '{}'", path))?;
@@ -86,7 +84,7 @@ pub(crate) fn parse_sample_variants(
         };
         // e.g. "ENST00000367770.5" starts with "ENST" -> ok; "NM_001256789.1" -> not ok, logged and skipped
         if !enst.starts_with("ENST") {
-            exceptions.log(&identifier, &format!("'{}' does not look like an ENST id; skipping line", enst));
+            info!("{},'{}' does not look like an ENST id; skipping line", &identifier, enst);
             continue;
         }
 
@@ -95,7 +93,7 @@ pub(crate) fn parse_sample_variants(
             Some(v) => v,
             None => {
                 // e.g. "ENST00000367770.5" alone on the line, no second field
-                exceptions.log(&identifier, &format!("missing variant field for {}", enst));
+                info!("{},missing variant field for {}", &identifier, enst);
                 continue;
             }
         };
@@ -104,10 +102,7 @@ pub(crate) fn parse_sample_variants(
         match positions_match(variant_string) {
             Some(true) => {}
             Some(false) => {
-                exceptions.log(
-                    &identifier,
-                    &format!("position mismatch in variant '{}' for {}", variant_string, enst),
-                );
+                info!("{},position mismatch in variant '{}' for {}", &identifier, variant_string, enst);
                 continue;
             }
             None => {
@@ -127,10 +122,7 @@ pub(crate) fn parse_sample_variants(
         let variant = match to_variant(&format!("{}:{}", enst, idx), variant_string) {
             Some(v) => v,
             None => {
-                exceptions.log(
-                    &identifier,
-                    &format!("could not parse variant '{}' for {}", variant_string, enst),
-                );
+                info!("{},could not parse variant '{}' for {}", &identifier, variant_string, enst);
                 continue;
             }
         };

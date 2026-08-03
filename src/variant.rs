@@ -1,22 +1,14 @@
 use crate::types::UniProtIsoId;
 
-/// Represents a single amino acid change: residues `begin..=end` (`replaced`) are
-/// swapped for `replacement`. An empty `replacement` means the range is deleted
-/// ("Missing"). Only the affected range is stored, not the full before/after
-/// sequence. `begin`/`end` are in canonical coordinates, unless a variant is
-/// isoforms specific. Isoform specific variants are written as "ISO_ID:POS" in the FT line,
-/// e.g., "P04637-2:45" rather than a bare "45".
-/// Equality and Hash deliberately ignores `id`, because sample specific varaints may 
-/// match a known variant from UniProt or EBI.
-/// `end = begin + len(replaced) - 1` (single-residue has begin == end).
+
 #[derive(Debug, Clone)]
 pub(crate) struct Variant {
     pub(crate) isoform: Option<UniProtIsoId>,
     pub(crate) id: String,
     pub(crate) begin: usize,
     pub(crate) end: usize,
-    pub(crate) aa_ref: String,
-    pub(crate) aa_new: String,
+    pub(crate) aa_ref: Option<String>, 
+    pub(crate) aa_new: Option<String>, // None encodes missing sequence
 }
 
 //skips id field
@@ -57,49 +49,70 @@ impl Variant {
 
 impl Variant {
     pub(crate) fn resolve_stop(&mut self, seq: &str) -> anyhow::Result<()> {
-        if self.aa_ref == "*" {
-            let last = seq
-                .chars()
-                .last()
-                .ok_or_else(|| anyhow::anyhow!(
-                    "cannot resolve stop-loss variant {} (aa_ref='*', aa_new='{}'): sequence is empty",
-                    self.id, self.aa_new
-                ))?
-                .to_string();
-            let mt = self.aa_new.trim_end_matches('*');
-            self.begin = seq.len();
-            self.end = seq.len();
-            self.aa_ref = last.clone();
-            self.aa_new = format!("{}{}", last, mt);
-        } else if self.aa_new.ends_with('*') || self.aa_new == "del" {
-            let suffix_start = self
-                .begin
-                .checked_add(self.aa_ref.len())
-                .and_then(|n| n.checked_sub(1))
-                .ok_or_else(|| anyhow::anyhow!(
-                    "variant {} has an invalid begin/aa_ref combination (begin={}, aa_ref='{}', len={}): \
-                     computing begin + len(aa_ref) - 1 overflowed",
-                    self.id, self.begin, self.aa_ref, self.aa_ref.len()
-                ))?;
-            let suffix = seq.get(suffix_start..).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "variant {} claims residues {}..{} (aa_ref='{}', aa_new='{}'), which extends to \
-                     position {} in the sequence, but the sequence is only {} residues long \
-                     ({} residue(s) too short). This usually means the variant's source (EBI or \
-                     sample data) and the sequence being resolved against (canonical or isoform) \
-                     don't agree on length — e.g. the variant may belong to a different isoform, \
-                     or the UniProt sequence has since been updated.",
-                    self.id, self.begin, self.begin + self.aa_ref.len().saturating_sub(1),
-                    self.aa_ref, self.aa_new,
-                    suffix_start, seq.len(),
-                    suffix_start.saturating_sub(seq.len()).max(1)
-                )
-            })?;
-            self.end = seq.len();
-            self.aa_ref = format!("{}{}", self.aa_ref, suffix);
-            self.aa_new = self.aa_new.trim_end_matches('*').to_string();
+        if seq.len() < 1 {
+            return Err(anyhow::anyhow!("Isoform sequence is empty. Variant at position [{}] is ommited", self.begin));
         }
-        Ok(())
+        if let Some(aa_ref) = self.aa_ref.clone() && let Some(aa_new) = self.aa_new.clone(){
+            // "del" sequence: alternative missing encoding in EBI. Positions are assumed to stay correct
+            if aa_new == "del" {
+                self.aa_new = None;
+
+                return Ok(());
+            }
+
+            // resolve stop lost: set aa_ref to last(seq), aa_new' to last(seq) + aa_new
+            if aa_ref.ends_with("*") {
+                if aa_ref.len() <= 1 {
+                    return Err(anyhow::anyhow!("Malformed variant: reference sequence ends with [*] and is longer than one character"));
+                }
+                self.end = seq.len();
+                // safe beacause seq.len() > 1
+                let last = seq.chars().last().unwrap();
+
+                self.aa_ref = Some(last.to_string());
+                self.aa_new = Some(format!("{}{}", last, aa_new.trim_end_matches("*")));
+
+            }
+
+            // resolve stop gain: strip * and, set self.end to len(seq)
+            if aa_new.ends_with('*') {
+                self.end = seq.len();
+                // Missing sequence: set ref and new to None
+                if aa_new.len() <= 1 {
+                    self.aa_ref = None;
+                    self.aa_new = None;
+                }
+                else {
+                    if let Some(suffix_end) = self
+                        .begin
+                        .checked_add(aa_ref.len())
+                        .and_then(|n| n.checked_sub(1)) 
+                        {
+                        if let Some(seq_suffix) = seq.get(self.begin..suffix_end){
+                            self.aa_ref = Some(format!("{}{}", aa_ref, seq_suffix));
+                            self.aa_new = Some(aa_new.trim_end_matches("*").to_string())
+                        } else {
+                            return Err(
+                                anyhow::anyhow!(
+                                    "Variant {} claims residues {}..{} (aa_ref='{}', aa_new='{}').",
+                                    self.id, self.begin, self.begin + aa_ref.len().saturating_sub(1),
+                                    aa_ref, aa_new
+                                )
+                            )
+                        }
+                    } else {
+                        return Err(
+                            anyhow::anyhow!(
+                                "Calculation for (begin={}, aa_ref='{}', len={}): \
+                                computing begin + len(aa_ref) - 1 overflowed",
+                                self.begin, aa_ref, aa_ref.len()
+                            )
+                        )
+                    }   
+                }
+            }   
+        }
+        Ok(()) 
     }
 }
 

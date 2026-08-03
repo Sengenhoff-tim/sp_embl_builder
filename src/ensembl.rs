@@ -2,7 +2,6 @@
 // Ensembl sequence API model and fetch
 // ============================================================================
 
-use crate::exceptions::ExceptionLog;
 use crate::types::{EnsemblId, Sequence};
 use crate::util::{with_retries, RetryConfig};
 use anyhow::{anyhow, Context, Result};
@@ -24,14 +23,6 @@ struct EnsemblSequenceResponse {
     #[serde(rename = "id")]
     #[allow(dead_code)]
     response_id: String,
-}
-
-fn strip_version(ensembl_id: &str) -> String {
-    ensembl_id
-        .split('.')
-        .next()
-        .unwrap_or(ensembl_id)
-        .to_string()
 }
 
 async fn fetch_ensembl_sequence_batch(
@@ -71,35 +62,26 @@ async fn fetch_ensembl_sequence_batch(
 /// trailing '*' stop-codon marker (e.g. for select readthrough transcripts).
 /// Strip it so downstream position math, which assumes a pure amino-acid
 /// sequence, stays correct.
-fn strip_stop_codon(enst: &str, seq: String, exceptions: &mut ExceptionLog) -> String {
+fn strip_stop_codon(enst: &str, seq: String) -> String {
     match seq.strip_suffix('*') {
         Some(stripped) => {
-            exceptions.log(enst, "retrieved sequence had a trailing '*' stop codon; stripped it");
+            tracing::info!(
+                enst = enst,
+                "retrieved sequence had a trailing '*' stop codon; stripped it"
+            );
             stripped.to_string()
         }
         None => seq,
     }
 }
 
-/// Fetches Ensembl protein sequences for all `enst_ids`. A batch that still
-/// fails after retries is treated as fatal rather than being dropped: these
-/// are the ENSTs that had no UniProt cross-reference, so a silently missing
-/// sequence here means the corresponding variants are dropped from the
-/// output with no trace. Per-record data-quality issues (wrong molecule
-/// type, trailing stop codon) are not fetch failures and continue to go
-/// through `exceptions` instead.
-///
-/// Batches are fetched sequentially (this path only runs for ENSTs left
-/// unmapped by UniProt, which is comparatively rare) — can be parallelized
-/// the same way as `uniprot.rs`/`ebi.rs` if it becomes a bottleneck.
 pub(crate) async fn fetch_ensembl_sequences(
     enst_ids: &[EnsemblId],
-    exceptions: &mut ExceptionLog,
     retry_config: &RetryConfig,
 ) -> Result<Vec<(EnsemblId, Sequence)>> {
     let id_strings: Vec<String> = enst_ids
         .iter()
-        .map(|id| strip_version(id.as_str()))
+        .map(|id| id.as_str().to_string())
         .collect();
     let mut sequences: HashMap<String, Sequence> = HashMap::new();
     let client = reqwest::Client::new();
@@ -108,13 +90,14 @@ pub(crate) async fn fetch_ensembl_sequences(
         let responses = fetch_ensembl_sequence_batch(chunk, retry_config, &client).await?;
         for record in responses {
             if record.molecule != "protein" {
-                exceptions.log(
-                    &record.query,
-                    &format!("expected molecule type 'protein', got '{}'; skipping", record.molecule),
+                tracing::info!(
+                    enst = record.query.as_str(),
+                    "expected molecule type 'protein', got '{}'; skipping",
+                    record.molecule
                 );
                 continue;
             }
-            let seq = strip_stop_codon(&record.query, record.seq, exceptions);
+            let seq = strip_stop_codon(&record.query, record.seq);
             sequences.insert(record.query, Sequence(seq));
         }
     }
@@ -123,7 +106,7 @@ pub(crate) async fn fetch_ensembl_sequences(
         .iter()
         .filter_map(|id| {
             sequences
-                .remove(&strip_version(id.as_str()))
+                .remove(id.as_str())
                 .map(|seq| (id.clone(), seq))
         })
         .collect())

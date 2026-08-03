@@ -9,12 +9,15 @@
 // 7) ENSTs unmapped to any UniProt entry → fetch sequence from Ensembl REST;
 //    emit synthetic flat-file entries
 //
+// Warnings and skipped/malformed records are logged via `tracing`, writing
+// to both stderr and the exceptions file given via `--exceptions` (see
+// `init_logging` below) — there is no more in-process ExceptionLog type.
+//
 // Usage: map_variants --accessions <accessions.txt> --variants <variants.txt> [--output <out.txt>]
 
 mod cli;
 mod ebi;
 mod ensembl;
-mod exceptions;
 mod format;
 mod isoform;
 mod parsing;
@@ -25,39 +28,70 @@ mod variant;
 
 use cli::Cli;
 use ensembl::fetch_ensembl_sequences;
-use exceptions::ExceptionLog;
 use format::format_entry;
-use isoform::{
-    collect_isoform_ids, 
-    collect_and_reconstruct_isoforms,
-};
+use isoform::collect_and_reconstruct_isoforms;
+use tracing_subscriber::Layer;
 use variant::*;
 use parsing::{parse_accession_list, parse_sample_variants};
-use types::{EnsemblId, Isoform, Sequence, UniProtId, UniProtIsoId};
+use types::{EnsemblId, UniProtId};
 use uniprot::{fetch_uniprot_entries, UniProtEntry, get_ensembl_mapping};
 use util::RetryConfig;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Write};
-use std::process;
+use std::sync::Arc;
 use std::time::Duration;
 
-use crate::ebi::{ProteinFeatureInfo, feature_to_canon_variant, feature_to_iso_variant, fetch_canon_variations, fetch_iso_variations, EBI_MAX_REQUESTS_PER_SECOND};
+use crate::ebi::{feature_to_canon_variant, feature_to_iso_variant, fetch_canon_variations, fetch_iso_variations, EBI_MAX_REQUESTS_PER_SECOND};
 use crate::types::UniProtCanonId;
 use crate::uniprot::UniProtFeature;
 use crate::util::RateLimiter;
 use futures::stream::{self, StreamExt};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Caps how many UniProt entries are processed (and thus how many EBI
 /// fetches are in flight) concurrently. EBI request *rate* is separately
 /// capped by the shared `RateLimiter` passed into every task, so this only
 /// bounds concurrency, not throughput.
-const MAX_CONCURRENT_ENTRIES: usize = 8;
+const MAX_CONCURRENT_ENTRIES: usize = 16;
+
+/// Sets up `tracing` to write every `warn!`/`error!` (and above) both to
+/// stderr (for live progress) and to `exceptions_path` (for a persistent,
+/// traceable record) — replacing the old hand-rolled `ExceptionLog`.
+///
+/// Returns the `tracing-appender` worker guard, which must be kept alive
+/// for the duration of `main` — the file writer is non-blocking and
+/// buffers writes on a background thread; dropping the guard early can
+/// lose buffered log lines.
+fn init_logging(exceptions_path: &str) -> Result<tracing_appender::non_blocking::WorkerGuard> {
+    let log_file = File::create(exceptions_path)
+        .with_context(|| format!("failed to create exceptions file '{}'", exceptions_path))?;
+    let (non_blocking, guard) = tracing_appender::non_blocking(log_file);
+
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(non_blocking)
+        .with_ansi(false)
+        .with_target(false);
+
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_ansi(true)
+        .with_target(false)
+        .with_filter(tracing_subscriber::filter::LevelFilter::WARN);
+
+    tracing_subscriber::registry()
+        .with(file_layer)
+        .with(stderr_layer)
+        .try_init()
+        .context("failed to initialize tracing subscriber")?;
+
+    Ok(guard)
+}
 
 #[tokio::main]
-async fn main() {
+async fn main() -> anyhow::Result<()>{
     use clap::Parser;
     let args = Cli::parse();
     let source_type_refs: Vec<&str> = args.source_type.iter().map(String::as_str).collect();
@@ -67,17 +101,21 @@ async fn main() {
         backoff_base_ms: args.retry_backoff_ms,
     };
 
-    if let Err(e) = run(
+    let _log_guard = init_logging(&args.exceptions)
+        .context("unable to set up exception logging")?;
+
+
+    run(
         &args.accessions,
         &args.variants,
         args.output.as_deref(),
         &source_type_refs,
-        &args.exceptions,
         &retry_config,
-    ).await {
-        eprintln!("Error: {:?}", e);
-        process::exit(1);
-    }
+    )
+        .await
+        .context("run failed")?;
+
+    Ok(())
 }
 
 /// Write one synthetic flat-file entry, followed by a blank line, to `out`.
@@ -93,6 +131,16 @@ fn write_entry(
         .with_context(|| format!("failed to write output entry for {}", accession.as_str()))
 }
 
+/// Attempts to resolve a premature-stop / out-of-bounds condition for `var`
+/// against `seq`. On success, pushes `var` into `collection`; on failure,
+/// logs the variant id and error via `tracing::info!` and drops the variant.
+fn try_add_variant(collection: &mut Vec<Variant>, mut var: Variant, seq: &str) {
+    match var.resolve_stop(seq) {
+        Ok(_) => collection.push(var),
+        Err(e) => tracing::info!("{},{}", var.id.as_str(), e),
+    }
+}
+
 /// Processes a single UniProt entry: reconstructs isoforms, joins
 /// ENST-derived sample variants with UniProt-annotated and EBI-derived
 /// variants, and returns the fully formatted output line plus the set of
@@ -102,8 +150,8 @@ fn write_entry(
 async fn process_entry(
     canonical_id: UniProtCanonId,
     entry: UniProtEntry,
-    global_sample_variants: std::sync::Arc<HashMap<EnsemblId, Vec<Variant>>>,
-    source_types: std::sync::Arc<Vec<String>>,
+    global_sample_variants: Arc<HashMap<EnsemblId, Vec<Variant>>>,
+    source_types: Arc<Vec<String>>,
     retry_config: RetryConfig,
     ebi_rate_limiter: RateLimiter,
     ebi_client: reqwest::Client,
@@ -111,11 +159,14 @@ async fn process_entry(
     let source_type_refs: Vec<&str> = source_types.iter().map(String::as_str).collect();
     let mut assigned_enst = HashSet::new();
 
+    // Any isoform that can't be reconstructed is logged (via tracing::warn!,
+    // from inside collect_and_reconstruct_isoforms/reconstruct_isoform) and
+    // skipped rather than failing the whole entry.
     let (
         canonical_iso_alias,
         isoforms,
         var_seq_features,
-        uniprot_variants
+        uniprot_variants,
     ) = collect_and_reconstruct_isoforms(&entry)?;
 
     // collect ensembl variants
@@ -133,19 +184,12 @@ async fn process_entry(
         if matches {
             if let Some(variants) = global_sample_variants.get(&ensembl_id) {
                 for var in variants {
-                    let mut var = var.clone();
-                    if let Err(e) = var.resolve_stop(&entry.sequence.value) {
-                        eprintln!(
-                            "\nWarning: skipping variant {} for {}: {:?}",
-                            var.id, canonical_id.as_str(), e
-                        );
-                        continue;
-                    }
-                    entry_sample_variants.push(var);
+                    try_add_variant(&mut entry_sample_variants, var.clone(), &entry.sequence.value);
                 }
                 assigned_enst.insert(ensembl_id);
             }
         }
+
         // variants for isoforms
         else {
             let iso_id = match uniprot_id {
@@ -158,14 +202,7 @@ async fn process_entry(
                     for var in iso_variants {
                         let mut var = var.clone();
                         var.isoform = Some(iso_id.clone());
-                        if let Err(e) = var.resolve_stop(iso_seq) {
-                            eprintln!(
-                                "\nWarning: skipping variant {} for {}: {:?}",
-                                var.id, iso_id.as_str(), e
-                            );
-                            continue;
-                        }
-                        entry_sample_variants.push(var);
+                        try_add_variant(&mut entry_sample_variants, var, iso_seq);
                     }
                     assigned_enst.insert(ensembl_id);
                 }
@@ -177,9 +214,6 @@ async fn process_entry(
     combined_variants.join(uniprot_variants);
 
     // collect ebi variants
-    // canonical — uses the *shared* rate limiter and client passed in, so
-    // this entry's requests are paced against the same global EBI budget
-    // as every other concurrently-processed entry.
     let mut ebi_canon_variants = fetch_canon_variations(
         &vec![canonical_id.clone()],
         &source_type_refs,
@@ -205,15 +239,8 @@ async fn process_entry(
 
     for (_, feat_info) in ebi_canon_variants.drain() {
         for ft in feat_info.features {
-            if let Some(mut canon_variant) = feature_to_canon_variant(&ft) {
-                if let Err(e) = canon_variant.resolve_stop(&entry.sequence.value) {
-                    eprintln!(
-                        "\nWarning: skipping EBI variant {} for {}: {:?}",
-                        canon_variant.id, canonical_id.as_str(), e
-                    );
-                    continue;
-                }
-                ebi_variants.push(canon_variant)
+            if let Some(canon_variant) = feature_to_canon_variant(&entry.primary_accession, &ft) {
+                try_add_variant(&mut ebi_variants, canon_variant, &entry.sequence.value);
             }
         }
     }
@@ -221,15 +248,8 @@ async fn process_entry(
     for (iso_id, feat_info) in ebi_iso_variants.drain() {
         for ft in feat_info.features {
             if let Some(iso_seq) = isoforms.get(&iso_id) {
-                if let Some(mut iso_variant) = feature_to_iso_variant(&iso_id, &ft) {
-                    if let Err(e) = iso_variant.resolve_stop(iso_seq.as_str()) {
-                        eprintln!(
-                            "\nWarning: skipping EBI variant {} for {}: {:?}",
-                            iso_variant.id, iso_id.as_str(), e
-                        );
-                        continue;
-                    }
-                    ebi_variants.push(iso_variant);
+                if let Some(iso_variant) = feature_to_iso_variant(&iso_id, &ft) {
+                    try_add_variant(&mut ebi_variants, iso_variant, iso_seq.as_str());
                 }
             }
         }
@@ -247,7 +267,6 @@ async fn run(
     variants_path: &str,
     output_path: Option<&str>,
     source_types: &[&str],
-    exceptions_path: &str,
     retry_config: &RetryConfig,
 ) -> Result<()> {
     let mut out: Box<dyn Write> = match output_path {
@@ -256,13 +275,13 @@ async fn run(
         ),
         None => Box::new(io::stdout()),
     };
-    let mut exceptions = ExceptionLog::to_file(exceptions_path)?;
 
     // 1. Parse inputs
     let accessions = parse_accession_list(uniprot_accessions_path)?;
-    let global_sample_variants = parse_sample_variants(variants_path, &mut exceptions)?;
-    let global_sample_variants = std::sync::Arc::new(global_sample_variants);
-    let source_types_owned = std::sync::Arc::new(
+    let global_sample_variants = parse_sample_variants(variants_path)?;
+    let global_sample_variants = Arc::new(global_sample_variants);
+
+    let source_types_owned = Arc::new(
         source_types.iter().map(|s| s.to_string()).collect::<Vec<String>>()
     );
 
@@ -273,12 +292,6 @@ async fn run(
     //    plus a canonical-id -> isoform-ids index.
     let mut global_assinged_enst = HashSet::new();
 
-    // One EBI rate limiter and one reqwest client, shared (via clone, i.e.
-    // shared Arc/connection pool under the hood) across every concurrently
-    // processed entry below — constructing a fresh limiter per entry would
-    // let concurrent entries collectively exceed the intended EBI request
-    // rate, since each limiter would pace itself independently rather than
-    // against a shared budget.
     let ebi_rate_limiter = RateLimiter::per_second(EBI_MAX_REQUESTS_PER_SECOND);
     let ebi_client = reqwest::Client::new();
 
@@ -287,8 +300,8 @@ async fn run(
 
     let mut results = stream::iter(uniprot_entries.into_iter())
         .map(|(canonical_id, entry)| {
-            let global_sample_variants = std::sync::Arc::clone(&global_sample_variants);
-            let source_types_owned = std::sync::Arc::clone(&source_types_owned);
+            let global_sample_variants = Arc::clone(&global_sample_variants);
+            let source_types_owned = Arc::clone(&source_types_owned);
             let retry_config = *retry_config;
             let ebi_rate_limiter = ebi_rate_limiter.clone();
             let ebi_client = ebi_client.clone();
@@ -308,14 +321,22 @@ async fn run(
         .buffer_unordered(MAX_CONCURRENT_ENTRIES);
 
     while let Some((canonical_id, result)) = results.next().await {
-        let (line, assigned_enst) = result
-            .with_context(|| format!("failed to process entry {}", canonical_id.as_str()))?;
-        writeln!(out, "{}", line)
-            .with_context(|| format!("failed to write output entry for {}", canonical_id.as_str()))?;
-        global_assinged_enst.extend(assigned_enst);
+        match result {
+            Ok((line, assigned_enst)) => {
+                writeln!(out, "{}", line)
+                    .with_context(|| format!("failed to write output entry for {}", canonical_id.as_str()))?;
+                global_assinged_enst.extend(assigned_enst);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    entry = canonical_id.as_str(),
+                    "skipping entry entirely due to error: {:?}", e
+                );
+            }
+        }
 
         completed += 1;
-        eprint!("\rProcessed entry {}/{}: {}\n", completed, total_entries, canonical_id.as_str());
+        eprint!("\rProcessed entry {}/{}: {}", completed, total_entries, canonical_id.as_str());
         io::stderr().flush().ok();
     }
     eprintln!();
@@ -329,7 +350,7 @@ async fn run(
         .collect();
 
     if !unmapped_enst_ids.is_empty() {
-        let enst_sequences = fetch_ensembl_sequences(&unmapped_enst_ids, &mut exceptions, retry_config).await?;
+        let enst_sequences = fetch_ensembl_sequences(&unmapped_enst_ids, retry_config).await?;
         for (enst_id, seq) in &enst_sequences {
             let variants = global_sample_variants.get(enst_id).map(Vec::as_slice).unwrap_or(&[]);
             let synthetic_id = UniProtCanonId(enst_id.as_str().to_string());
