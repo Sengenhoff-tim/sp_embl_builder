@@ -10,10 +10,12 @@ pub(crate) struct Cli {
     /// Path to accession list file
     #[arg(long)]
     pub(crate) accessions: String,
-    
-    /// Path to ENST variant file
-    #[arg(long)]
-    pub(crate) variants: String,
+
+    /// Path to ENST variant file. If omitted, no ENST-derived sample variants
+    /// are included (only UniProt/EBI variants, per --uniprot-variants /
+    /// --ebi-variants).
+        #[arg(long)]
+    pub(crate) variants: Option<String>,
 
     /// Path to write the synthetic flat-file output to. Defaults to stdout.
     #[arg(long)]
@@ -21,11 +23,20 @@ pub(crate) struct Cli {
 
     /// Filter EBI variants by sourceType (comma-separated, up to 2).
     /// Allowed values: uniprot, large scale study, mixed, clinvar, nci-tcga,
-    /// cosmic curated, ensembl, gnomad, topmed, exac. Pass "None" on its own
-    /// to skip fetching EBI variants entirely (only UniProt/ENST variants are
-    /// used).
+    /// cosmic curated, ensembl, gnomad, topmed, exac.
     #[arg(long, value_delimiter = ',')]
     pub(crate) source_type: Vec<String>,
+
+    /// Whether to fetch and include EBI-derived variants. If false, EBI is
+    /// never queried and only UniProt/ENST-derived variants are used.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub(crate) ebi_variants: bool,
+
+    /// Whether to include UniProt-annotated variants. If false, UniProt's own
+    /// variant annotations are excluded (ENST/EBI-derived variants from other
+    /// sources are unaffected by this flag).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub(crate) uniprot_variants: bool,
 
     /// Path to write skipped/malformed-input exceptions to, as tab-separated
     /// `<identifier>\t<message>` lines.

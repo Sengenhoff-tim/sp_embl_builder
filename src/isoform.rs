@@ -100,16 +100,6 @@ fn apply_var_seq_features(canonical: &str, features: &[&UniProtFeature]) -> Resu
 }
 
 /// Reconstruct a single isoform's sequence from its VAR_SEQ features.
-///
-/// Returns `None` (logging a infoing via `tracing::info!`) instead of
-/// failing outright for any condition that means *this specific isoform*
-/// can't be reconstructed: an unsupported/unknown status ("Not described",
-/// "External", or anything else besides "Described"), a mismatch between
-/// the declared VSP ids and the features actually found, or a failure
-/// while applying the VAR_SEQ features themselves (out-of-range position,
-/// original-sequence mismatch, etc). None of these should abort processing
-/// of the rest of the entry — they mean one isoform is skipped, nothing
-/// more.
 fn reconstruct_isoform(
     entry: &UniProtEntry,
     isoform_id: UniProtIsoId,
