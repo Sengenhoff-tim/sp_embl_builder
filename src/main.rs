@@ -111,6 +111,8 @@ async fn main() -> anyhow::Result<()>{
         args.output.as_deref(),
         &source_type_refs,
         &retry_config,
+        args.ebi_variants,
+        args.uniprot_variants,
     )
         .await
         .context("run failed")?;
@@ -155,13 +157,12 @@ async fn process_entry(
     retry_config: RetryConfig,
     ebi_rate_limiter: RateLimiter,
     ebi_client: reqwest::Client,
+    ebi_variants_enabled: bool,
+    uniprot_variants_enabled: bool,
 ) -> Result<(String, HashSet<EnsemblId>)> {
     let source_type_refs: Vec<&str> = source_types.iter().map(String::as_str).collect();
     let mut assigned_enst = HashSet::new();
 
-    // Any isoform that can't be reconstructed is logged (via tracing::warn!,
-    // from inside collect_and_reconstruct_isoforms/reconstruct_isoform) and
-    // skipped rather than failing the whole entry.
     let (
         canonical_iso_alias,
         isoforms,
@@ -180,7 +181,6 @@ async fn process_entry(
             UniProtId::Iso(id) => Some(id) == canonical_iso_alias.as_ref(),
         };
 
-        //variants for canonical sequence
         if matches {
             if let Some(variants) = global_sample_variants.get(&ensembl_id) {
                 for var in variants {
@@ -188,10 +188,7 @@ async fn process_entry(
                 }
                 assigned_enst.insert(ensembl_id);
             }
-        }
-
-        // variants for isoforms
-        else {
+        } else {
             let iso_id = match uniprot_id {
                 UniProtId::Iso(iso_id) => iso_id,
                 UniProtId::Id(_) => continue,
@@ -211,51 +208,54 @@ async fn process_entry(
     }
 
     let mut combined_variants = entry_sample_variants;
-    combined_variants.join(uniprot_variants);
 
-    // collect ebi variants
-    let mut ebi_canon_variants = fetch_canon_variations(
-        &vec![canonical_id.clone()],
-        &source_type_refs,
-        &retry_config,
-        &ebi_rate_limiter,
-        &ebi_client,
-    ).await?;
-
-    // isoform
-    let mut iso_keys = Vec::new();
-    for isoform in isoforms.clone() {
-        iso_keys.push(isoform.0);
+    if uniprot_variants_enabled {
+        combined_variants.join(uniprot_variants);
     }
-    let mut ebi_iso_variants = fetch_iso_variations(
-        &iso_keys,
-        &source_type_refs,
-        &retry_config,
-        &ebi_rate_limiter,
-        &ebi_client,
-    ).await?;
 
-    let mut ebi_variants = Vec::new();
+    if ebi_variants_enabled {
+        let mut ebi_canon_variants = fetch_canon_variations(
+            &vec![canonical_id.clone()],
+            &source_type_refs,
+            &retry_config,
+            &ebi_rate_limiter,
+            &ebi_client,
+        ).await?;
 
-    for (_, feat_info) in ebi_canon_variants.drain() {
-        for ft in feat_info.features {
-            if let Some(canon_variant) = feature_to_canon_variant(&entry.primary_accession, &ft) {
-                try_add_variant(&mut ebi_variants, canon_variant, &entry.sequence.value);
-            }
+        let mut iso_keys = Vec::new();
+        for isoform in isoforms.clone() {
+            iso_keys.push(isoform.0);
         }
-    }
+        let mut ebi_iso_variants = fetch_iso_variations(
+            &iso_keys,
+            &source_type_refs,
+            &retry_config,
+            &ebi_rate_limiter,
+            &ebi_client,
+        ).await?;
 
-    for (iso_id, feat_info) in ebi_iso_variants.drain() {
-        for ft in feat_info.features {
-            if let Some(iso_seq) = isoforms.get(&iso_id) {
-                if let Some(iso_variant) = feature_to_iso_variant(&iso_id, &ft) {
-                    try_add_variant(&mut ebi_variants, iso_variant, iso_seq.as_str());
+        let mut ebi_variants = Vec::new();
+
+        for (_, feat_info) in ebi_canon_variants.drain() {
+            for ft in feat_info.features {
+                if let Some(canon_variant) = feature_to_canon_variant(&entry.primary_accession, &ft) {
+                    try_add_variant(&mut ebi_variants, canon_variant, &entry.sequence.value);
                 }
             }
         }
-    }
 
-    combined_variants.join(ebi_variants);
+        for (iso_id, feat_info) in ebi_iso_variants.drain() {
+            for ft in feat_info.features {
+                if let Some(iso_seq) = isoforms.get(&iso_id) {
+                    if let Some(iso_variant) = feature_to_iso_variant(&iso_id, &ft) {
+                        try_add_variant(&mut ebi_variants, iso_variant, iso_seq.as_str());
+                    }
+                }
+            }
+        }
+
+        combined_variants.join(ebi_variants);
+    }
 
     let line = format_entry(&canonical_id, &entry.sequence.value, Some(&var_seq_features), &combined_variants, Some(&entry));
 
@@ -268,6 +268,8 @@ async fn run(
     output_path: Option<&str>,
     source_types: &[&str],
     retry_config: &RetryConfig,
+    ebi_variants_enabled: bool,
+    uniprot_variants_enabled: bool,
 ) -> Result<()> {
     let mut out: Box<dyn Write> = match output_path {
         Some(path) => Box::new(
@@ -314,6 +316,8 @@ async fn run(
                     retry_config,
                     ebi_rate_limiter,
                     ebi_client,
+                    ebi_variants_enabled,
+                    uniprot_variants_enabled,
                 ).await;
                 (canonical_id, result)
             }
