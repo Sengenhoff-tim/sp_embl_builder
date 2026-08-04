@@ -264,7 +264,7 @@ async fn process_entry(
 
 async fn run(
     uniprot_accessions_path: &str,
-    variants_path: &str,
+    variants_path: &Option<String>,
     output_path: Option<&str>,
     source_types: &[&str],
     retry_config: &RetryConfig,
@@ -280,7 +280,10 @@ async fn run(
 
     // 1. Parse inputs
     let accessions = parse_accession_list(uniprot_accessions_path)?;
-    let global_sample_variants = parse_sample_variants(variants_path)?;
+    let global_sample_variants = match variants_path {
+        Some(path) => parse_sample_variants(path)?,
+        None => HashMap::new(),
+    };
     let global_sample_variants = Arc::new(global_sample_variants);
 
     let source_types_owned = Arc::new(

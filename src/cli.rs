@@ -10,10 +10,12 @@ pub(crate) struct Cli {
     /// Path to accession list file
     #[arg(long)]
     pub(crate) accessions: String,
-    
-    /// Path to ENST variant file
-    #[arg(long)]
-    pub(crate) variants: String,
+
+    /// Path to ENST variant file. If omitted, no ENST-derived sample variants
+    /// are included (only UniProt/EBI variants, per --uniprot-variants /
+    /// --ebi-variants).
+        #[arg(long)]
+    pub(crate) variants: Option<String>,
 
     /// Path to write the synthetic flat-file output to. Defaults to stdout.
     #[arg(long)]
