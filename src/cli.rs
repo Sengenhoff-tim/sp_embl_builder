@@ -38,6 +38,9 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub(crate) uniprot_variants: bool,
 
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub(crate) ensembl_fallback: bool,
+
     /// Path to write skipped/malformed-input exceptions to, as tab-separated
     /// `<identifier>\t<message>` lines.
     #[arg(long, default_value = "exceptions.log")]
