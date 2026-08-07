@@ -29,7 +29,6 @@ pub(crate) struct EbiFeature {
     mutated_type: Option<String>,
 }
 
-const MAX_EBI_BATCH_SIZE: usize = 100;
 pub(crate) const EBI_MAX_REQUESTS_PER_SECOND: u32 = 200;
 
 const ALLOWED_SOURCE_TYPES: [&str; 10] = [
@@ -67,46 +66,45 @@ fn validate_source_types(source_types: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn build_variation_batch_url(uniprot_ids: &[String], source_types: &[&str]) -> Result<String> {
+/// Builds the URL for a single accession using EBI's singular path-style
+/// endpoint (`/variation/{accession}`), rather than the query-param batch
+/// endpoint (`/variation?accession=A,B,C`). We always fetch one accession
+/// at a time now, and the batch endpoint is known to reject/400 on certain
+/// single-accession requests, so the singular endpoint is used uniformly.
+fn build_variation_url(accession: &str, source_types: &[&str]) -> Result<String> {
     validate_source_types(source_types)?;
-    if uniprot_ids.is_empty() {
-        return Err(anyhow!("build_variation_batch_url called with no accessions"));
-    }
-    if uniprot_ids.len() > MAX_EBI_BATCH_SIZE {
-        return Err(anyhow!(
-            "at most {} accessions per batch, got {}",
-            MAX_EBI_BATCH_SIZE,
-            uniprot_ids.len()
-        ));
-    }
-    let mut url = format!(
-        "https://www.ebi.ac.uk/proteins/api/variation?accession={}",
-        uniprot_ids.join(",")
-    );
+    let mut url = format!("https://www.ebi.ac.uk/proteins/api/variation/{}", accession);
     if !source_types.is_empty() {
-        url.push_str("&sourcetype=");
+        url.push_str("?sourcetype=");
         url.push_str(&source_types.join(","));
     }
     Ok(url)
 }
 
-async fn fetch_variation_batch(
-    uniprot_ids: &[String],
+async fn fetch_variation_single(
+    accession: &str,
     source_types: &[&str],
     retry_config: &RetryConfig,
     client: &reqwest::Client,
-) -> Result<Vec<ProteinFeatureInfo>> {
+) -> Result<Option<ProteinFeatureInfo>> {
     with_retries(
-        &format!("fetching EBI variation for {} accessions", uniprot_ids.len()),
+        &format!("fetching EBI variation for {}", accession),
         retry_config,
         || async {
-            let url = build_variation_batch_url(uniprot_ids, source_types)?;
+            let url = build_variation_url(accession, source_types)?;
             let response = client
                 .get(&url)
                 .timeout(retry_config.timeout)
                 .send()
                 .await
                 .with_context(|| format!("EBI variation request to {} failed", url))?;
+
+            /* 
+            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                // No variation data for this accession - not an error.
+                return Ok(None);
+            }
+            */
 
             if !response.status().is_success() {
                 let status = response.status();
@@ -118,9 +116,9 @@ async fn fetch_variation_batch(
                 .text()
                 .await
                 .context("failed to read EBI variation response body")?;
-            let info: Vec<ProteinFeatureInfo> = serde_json::from_str(&body)
+            let info: ProteinFeatureInfo = serde_json::from_str(&body)
                 .context("failed to parse EBI variation response as JSON")?;
-            Ok(info)
+            Ok(Some(info))
         },
     )
     .await
@@ -141,17 +139,14 @@ where
 
     let source_types_owned: Vec<String> = source_types.iter().map(|s| s.to_string()).collect();
 
-    let chunks: Vec<Vec<K>> = keys.chunks(MAX_EBI_BATCH_SIZE).map(|c| c.to_vec()).collect();
-    
     tracing::info!(
-        chunk_count = chunks.len(),
-        batch_size = MAX_EBI_BATCH_SIZE,
-        "Starting batch processing"
+        accession_count = keys.len(),
+        "Starting per-accession EBI variation fetch"
     );
 
-    let mut results = stream::iter(chunks)
-        .map(|chunk_keys| {
-            let id_strings: Vec<String> = chunk_keys.iter().map(&as_str).collect();
+    let mut results = stream::iter(keys.iter().cloned())
+        .map(|key| {
+            let accession = as_str(&key);
             let rate_limiter = rate_limiter.clone();
             let retry_config = *retry_config;
             let client = client.clone();
@@ -160,35 +155,26 @@ where
             async move {
                 rate_limiter.throttle().await;
                 let source_type_refs: Vec<&str> = source_types_owned.iter().map(String::as_str).collect();
-                
-                tracing::info!(
-                    id_count = id_strings.len(),
-                    source_types = ?source_type_refs,
-                    "Fetching variation batch"
-                );
-                
-                let infos = fetch_variation_batch(&id_strings, &source_type_refs, &retry_config, &client).await?;
-                
-                tracing::info!(
-                    fetched_count = infos.len(),
-                    "Batch fetch completed"
-                );
-                
-                Ok::<_, anyhow::Error>((chunk_keys, infos))
+
+                tracing::info!(accession = %accession, source_types = ?source_type_refs, "Fetching variation");
+
+                let info = fetch_variation_single(&accession, &source_type_refs, &retry_config, &client).await?;
+
+                Ok::<_, anyhow::Error>((key, info))
             }
         })
         .buffer_unordered(MAX_CONCURRENT_EBI_REQUESTS);
 
     while let Some(res) = results.next().await {
-        let (chunk_keys, infos) = res?;
-        for (i, info) in infos.into_iter().enumerate() {
-            result.insert(chunk_keys[i].clone(), info);
+        let (key, info) = res?;
+        if let Some(info) = info {
+            result.insert(key, info);
         }
     }
 
     tracing::info!(
         total_results = result.len(),
-        "Batch processing completed"
+        "Per-accession EBI variation fetch completed"
     );
 
     Ok(result)
@@ -219,27 +205,6 @@ pub(crate) async fn fetch_canon_variations(
 // ============================================================================
 // Variant building from EBI features
 // ============================================================================
-
-
-/// Build the `id` field for a Variant from an EBI feature.
-/// Format: `EBI:{UniProtId}:{position}:{mutatedType}`
-/// Falls back to the evidence string if neither ftId nor xrefs are present.
-fn build_variant_id(feature: &EbiFeature) -> String {
-    format!(
-        "EBI:{}:{}:{}",
-        feature
-            .ft_id
-            .as_ref()
-            .map(|s| s.as_str())
-            .unwrap_or("unknown"),
-        feature.begin,
-        feature
-            .mutated_type
-            .as_ref()
-            .map(|s| s.as_str())
-            .unwrap_or("unknown")
-    )
-}
 
 pub(crate) fn feature_to_iso_variant(accession: &UniProtIsoId, feature: &EbiFeature) -> Option<Variant> {
     if let Some(replaced) = &feature.wild_type {
