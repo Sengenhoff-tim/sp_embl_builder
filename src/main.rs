@@ -95,7 +95,12 @@ fn init_logging(exceptions_path: &str) -> Result<tracing_appender::non_blocking:
 async fn main() -> anyhow::Result<()>{
     use clap::Parser;
     let args = Cli::parse();
-    let source_type_refs: Vec<&str> = args.source_type.iter().map(String::as_str).collect();
+    let source_type_refs: Vec<&str> = args
+        .source_type
+        .iter()
+        .map(String::as_str)
+        .filter(|s| !s.is_empty())
+        .collect();
     let retry_config = RetryConfig {
         timeout: Duration::from_secs(args.timeout_secs),
         max_attempts: args.max_attempts,
