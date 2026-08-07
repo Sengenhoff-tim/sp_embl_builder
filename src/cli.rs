@@ -14,7 +14,7 @@ pub(crate) struct Cli {
     /// Path to ENST variant file. If omitted, no ENST-derived sample variants
     /// are included (only UniProt/EBI variants, per --uniprot-variants /
     /// --ebi-variants).
-        #[arg(long)]
+    #[arg(long)]
     pub(crate) variants: Option<String>,
 
     /// Path to write the synthetic flat-file output to. Defaults to stdout.
@@ -24,19 +24,26 @@ pub(crate) struct Cli {
     /// Filter EBI variants by sourceType (comma-separated, up to 2).
     /// Allowed values: uniprot, large scale study, mixed, clinvar, nci-tcga,
     /// cosmic curated, ensembl, gnomad, topmed, exac.
-    #[arg(long, value_delimiter = ',')]
+    #[arg(long, value_delimiter = ',', default_value = "")]
     pub(crate) source_type: Vec<String>,
 
     /// Whether to fetch and include EBI-derived variants. If false, EBI is
     /// never queried and only UniProt/ENST-derived variants are used.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    /// Can be used as flag (--ebi-variants) or with explicit value (--ebi-variants true/false).
+    #[arg(long, default_value_t = true, value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set, num_args = 0..=1, require_equals = true)]
     pub(crate) ebi_variants: bool,
 
     /// Whether to include UniProt-annotated variants. If false, UniProt's own
     /// variant annotations are excluded (ENST/EBI-derived variants from other
     /// sources are unaffected by this flag).
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    /// Can be used as flag (--uniprot-variants) or with explicit value (--uniprot-variants true/false).
+    #[arg(long, default_value_t = true, value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set, num_args = 0..=1, require_equals = true)]
     pub(crate) uniprot_variants: bool,
+
+    /// Whether to enable Ensembl fallback for sequence lookups.
+    /// Can be used as flag (--ensembl-fallback) or with explicit value (--ensembl-fallback true/false).
+    #[arg(long, default_value_t = true, value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set, num_args = 0..=1, require_equals = true)]
+    pub(crate) ensembl_fallback: bool,
 
     /// Path to write skipped/malformed-input exceptions to, as tab-separated
     /// `<identifier>\t<message>` lines.
@@ -59,3 +66,4 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = DEFAULT_RETRY_BACKOFF_MS)]
     pub(crate) retry_backoff_ms: u64,
 }
+

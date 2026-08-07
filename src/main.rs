@@ -30,6 +30,7 @@ use cli::Cli;
 use ensembl::fetch_ensembl_sequences;
 use format::format_entry;
 use isoform::collect_and_reconstruct_isoforms;
+use tracing::info;
 use tracing_subscriber::Layer;
 use variant::*;
 use parsing::{parse_accession_list, parse_sample_variants};
@@ -113,6 +114,7 @@ async fn main() -> anyhow::Result<()>{
         &retry_config,
         args.ebi_variants,
         args.uniprot_variants,
+        args.ensembl_fallback
     )
         .await
         .context("run failed")?;
@@ -270,6 +272,7 @@ async fn run(
     retry_config: &RetryConfig,
     ebi_variants_enabled: bool,
     uniprot_variants_enabled: bool,
+    use_ensembl_fallback: bool,
 ) -> Result<()> {
     let mut out: Box<dyn Write> = match output_path {
         Some(path) => Box::new(
@@ -348,7 +351,6 @@ async fn run(
     }
     eprintln!();
 
-
     // 8. ENSTs with no UniProt cross-reference mapping → synthetic entries
     let unmapped_enst_ids: Vec<EnsemblId> = global_sample_variants
         .keys()
@@ -357,13 +359,23 @@ async fn run(
         .collect();
 
     if !unmapped_enst_ids.is_empty() {
-        let enst_sequences = fetch_ensembl_sequences(&unmapped_enst_ids, retry_config).await?;
-        for (enst_id, seq) in &enst_sequences {
-            let variants = global_sample_variants.get(enst_id).map(Vec::as_slice).unwrap_or(&[]);
-            let synthetic_id = UniProtCanonId(enst_id.as_str().to_string());
-            write_entry(&mut *out, &synthetic_id, seq.as_str(), None, &variants, None)?;
+        if use_ensembl_fallback {
+            let enst_sequences = fetch_ensembl_sequences(&unmapped_enst_ids, retry_config).await?;
+            for (enst_id, seq) in &enst_sequences {
+                let variants = global_sample_variants.get(enst_id).map(Vec::as_slice).unwrap_or(&[]);
+                let synthetic_id = UniProtCanonId(enst_id.as_str().to_string());
+                write_entry(&mut *out, &synthetic_id, seq.as_str(), None, &variants, None)?;
+            }
+        }
+        else {
+            for enst in unmapped_enst_ids {
+                let variants = global_sample_variants.get(&enst).map(Vec::as_slice).unwrap_or(&[]);
+                for var in variants {
+                    info!("{},Variant {} could not be mapped", &enst.as_str(), &var.id);
+                }
+            }
         }
     }
-
+    
     Ok(())
 }
