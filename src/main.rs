@@ -263,8 +263,26 @@ async fn process_entry(
 
         combined_variants.join(ebi_variants);
     }
+    
+    //TODO move upstream
+    let valid_variants: Vec<Variant> = combined_variants
+        .into_iter()
+        .filter(|v| {
+            let ok = v.is_valid();
+            if !ok {
+                info!(
+                    "{},Variant [{}:{}>{}] failed validation and was dropped",
+                    &canonical_id.as_str(),
+                    v.begin, 
+                    v.aa_ref.clone().unwrap_or("NOT_FOUND".to_string()),
+                    v.aa_new.clone().unwrap_or("NOT_FOUND".to_string())
+                );
+            }
+            ok
+        })
+        .collect();
 
-    let line = format_entry(&canonical_id, &entry.sequence.value, Some(&var_seq_features), &combined_variants, Some(&entry));
+    let line = format_entry(&canonical_id, &entry.sequence.value, Some(&var_seq_features), &valid_variants, Some(&entry));
 
     Ok((line, assigned_enst))
 }
@@ -369,7 +387,27 @@ async fn run(
             for (enst_id, seq) in &enst_sequences {
                 let variants = global_sample_variants.get(enst_id).map(Vec::as_slice).unwrap_or(&[]);
                 let synthetic_id = UniProtCanonId(enst_id.as_str().to_string());
-                write_entry(&mut *out, &synthetic_id, seq.as_str(), None, &variants, None)?;
+                
+                //TODO move upstream
+                let valid_variants: Vec<Variant> = variants
+                    .iter()
+                    .cloned()
+                    .filter(|v| {
+                        let ok = v.is_valid();
+                        if !ok {
+                            info!(
+                                "{},Variant [{}:{}>{}] failed validation and was dropped",
+                                &synthetic_id.as_str(),
+                                v.begin,
+                                v.aa_ref.clone().unwrap_or("NOT_FOUND".to_string()),
+                                v.aa_new.clone().unwrap_or("NOT_FOUND".to_string())
+                            );
+                        }
+                        ok
+                    })
+                    .collect();
+                
+                write_entry(&mut *out, &synthetic_id, seq.as_str(), None, &valid_variants, None)?;
             }
         }
         else {

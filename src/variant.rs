@@ -47,6 +47,27 @@ impl Variant {
     }
 }
 
+fn is_valid_aa(s: &str) -> bool {
+    s.chars().all(|c| matches!(c, 'G' | 'A' | 'S' | 'P' | 'V' | 'T' | 'C' | 'L' | 'I' | 'N' | 'D' | 'Q' | 'K' | 'E' | 'M' | 'H' | 'F' | 'U' | 'R' | 'Y' | 'W' | 'O' | 'J' | 'X' | 'Z' | 'B'))
+}
+
+
+impl Variant {
+    pub(crate) fn is_valid(&self) -> bool{
+        if let Some(aa_ref) = &self.aa_ref {
+            if !is_valid_aa(&aa_ref) {
+                return false;
+            }
+        }
+        if let Some(aa_new) = &self.aa_new {
+            if !is_valid_aa(&aa_new) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 impl Variant {
     pub(crate) fn resolve_stop(&mut self, seq: &str) -> anyhow::Result<()> {
         if seq.len() < 1 {
