@@ -58,18 +58,18 @@ async fn fetch_ensembl_sequence_batch(
     .await
 }
 
-/// Ensembl occasionally returns a translated protein sequence with a
-/// trailing '*' stop-codon marker (e.g. for select readthrough transcripts).
-/// Strip it so downstream position math, which assumes a pure amino-acid
-/// sequence, stays correct.
+/// Ensembl occasionally returns a translated protein sequence with containing '*' stop-codon marker (e.g. for select readthrough transcripts). 
+/// Sequence is assumed to stop at the first stop codon
 fn strip_stop_codon(enst: &str, seq: String) -> String {
-    match seq.strip_suffix('*') {
-        Some(stripped) => {
+    match seq.find('*') {
+        Some(pos) => {
             tracing::info!(
                 enst = enst,
-                "retrieved sequence had a trailing '*' stop codon; stripped it"
+                "{}, sequence contained '*' stop codon at position {}; amino acids after are discarded",
+                enst,
+                pos
             );
-            stripped.to_string()
+            seq[..pos].to_string()
         }
         None => seq,
     }
