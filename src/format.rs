@@ -159,7 +159,8 @@ fn format_variant(variant: &Variant) -> Vec<String> {
             "Missing".to_string()
         };
     lines.extend(wrap_ft_qualifier("note", &note));
-    lines.extend(wrap_ft_qualifier("id", &variant.id));
+    //invalid in uniprot spec
+    lines.push(format!("/{}=\"{}\"","id", &variant.id));
     lines
 }
 
