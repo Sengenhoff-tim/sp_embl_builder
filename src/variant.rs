@@ -90,11 +90,14 @@ impl Variant {
                 return Ok(());
             }
 
-            tracing::warn!(
+            if !(ref_star_idx.unwrap_or(seq.len()) == seq.len() 
+                && new_star_idx.unwrap_or(seq.len()) == seq.len())  {
+                tracing::info!(
                 "Variant {} contains a stop codon marker [*] (aa_ref='{}', aa_new='{}'); \
                  best-effort truncating at first [*] to fit target encoding",
                 self.id, aa_ref, aa_new
             );
+            }
 
             // aa_new, truncated at its first '*' if present (position-independent).
             let new_trunc = match new_star_idx {
