@@ -41,7 +41,6 @@ impl Variant {
         if self.id.is_empty() {
             self.id = other.id.clone();
         } else {
-            self.id.push('|');
             self.id.push_str(&other.id);
         }
     }
