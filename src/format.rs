@@ -160,7 +160,7 @@ fn format_variant(variant: &Variant) -> Vec<String> {
         };
     lines.extend(wrap_ft_qualifier("note", &note));
     //invalid in uniprot spec
-    lines.push(format!("/{}=\"{}\"","id", &variant.id));
+    lines.push(format!("{}/{}=\"{}\"", FT_INDENT,"id", &variant.id));
     lines
 }
 
