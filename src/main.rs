@@ -386,10 +386,14 @@ async fn run(
             let enst_sequences = fetch_ensembl_sequences(&unmapped_enst_ids, retry_config).await?;
             for (enst_id, seq) in &enst_sequences {
                 let variants = global_sample_variants.get(enst_id).map(Vec::as_slice).unwrap_or(&[]);
+                let mut resolved_variants = Vec::new();
+                for variant in variants{
+                    try_add_variant(&mut resolved_variants, variant.clone(), seq.as_str());
+                }
                 let synthetic_id = UniProtCanonId(enst_id.as_str().to_string());
                 
                 //TODO move upstream
-                let valid_variants: Vec<Variant> = variants
+                let valid_variants: Vec<Variant> = resolved_variants
                     .iter()
                     .cloned()
                     .filter(|v| {
