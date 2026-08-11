@@ -209,7 +209,7 @@ pub(crate) fn feature_to_iso_variant(accession: &UniProtIsoId, feature: &EbiFeat
     if let Some(replaced) = &feature.wild_type {
         let begin: usize = feature.begin.parse().ok()?;
         let end = begin + replaced.len().checked_sub(1)?;
-        let id = "EBI".to_string();
+        let id = format!("EBI{}{}",begin, replaced );
         let isoform = Some(accession.clone());
         return Some(Variant {isoform, id, begin, end, aa_ref: Some(replaced.to_string()), aa_new: feature.mutated_type.clone() })
     }
