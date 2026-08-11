@@ -108,7 +108,6 @@ async fn fetch_variation_single(
 
             if !response.status().is_success() {
                 let status = response.status();
-                let body = response.text().await.unwrap_or_default();
                 return Err(anyhow!("EBI variation request failed: URL: [{}]; HTTP {}",url, status));
             }
 
