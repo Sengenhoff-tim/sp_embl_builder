@@ -119,7 +119,7 @@ pub(crate) fn parse_sample_variants(
 
         // e.g. "726G>726S" -> Some(Variant { .. }); "garbage!!" -> None, logged and skipped
         // variant id is set to "{ensembl_id_versionless}:{idx}" so that each variant has a unique id
-        let variant = match to_variant(&format!("{}{}", enst, idx), variant_string) {
+        let variant = match to_variant(&format!("{}_{}", enst, idx), variant_string) {
             Some(v) => v,
             None => {
                 info!("{},could not parse variant '{}' for {}", &identifier, variant_string, enst);
