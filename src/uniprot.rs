@@ -388,15 +388,19 @@ pub(crate) async fn fetch_uniprot_entries(
         .collect())
 }
 
-pub(crate) fn get_ensembl_mapping(cross_refernces: &[UniProtCrossReference]) -> Result<Vec<(UniProtId, EnsemblId)>>{
+pub(crate) fn get_ensembl_mapping(
+    primary_accession: &str,
+    cross_references: &[UniProtCrossReference],
+) -> Result<Vec<(UniProtId, EnsemblId)>> {
     let mut result = Vec::new();
-    for cross_ref in cross_refernces {
+    for cross_ref in cross_references {
         if cross_ref.database == "Ensembl" {
-            if let Some(iso_id) = &cross_ref.isoform_id {
-                let iso_id: UniProtId = iso_id.parse().unwrap();
-                let id: EnsemblId = strip_version(&cross_ref.id).parse().unwrap();
-                result.push((iso_id, id))
-            }
+            let id: EnsemblId = strip_version(&cross_ref.id).parse().unwrap();
+            let uniprot_id: UniProtId = match &cross_ref.isoform_id {
+                Some(iso_id) => iso_id.parse().unwrap(),
+                None => UniProtId::Id(UniProtCanonId(primary_accession.to_string())),
+            };
+            result.push((uniprot_id, id));
         }
     }
     Ok(result)

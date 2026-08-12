@@ -180,7 +180,7 @@ async fn process_entry(
     // collect ensembl variants
     let mut entry_sample_variants: Vec<Variant> = Vec::new();
 
-    let entry_ensembl_map = get_ensembl_mapping(&entry.cross_references)?;
+    let entry_ensembl_map = get_ensembl_mapping(&entry.primary_accession, &entry.cross_references)?;
 
     for (uniprot_id, ensembl_id) in entry_ensembl_map {
         let matches = match &uniprot_id {
@@ -311,6 +311,7 @@ async fn run(
         None => HashMap::new(),
     };
     let global_sample_variants = Arc::new(global_sample_variants);
+
 
     let source_types_owned = Arc::new(
         source_types.iter().map(|s| s.to_string()).collect::<Vec<String>>()

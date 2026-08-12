@@ -4,6 +4,7 @@
 
 use crate::types::{EnsemblId, UniProtCanonId};
 use crate::variant::Variant;
+use crate::util::strip_version;
 use anyhow::{Context, Result};
 use tracing::info;
 use std::collections::HashMap;
@@ -113,7 +114,7 @@ pub(crate) fn parse_sample_variants(
 
         // get entry for variant index
         let entry = variants
-            .entry(EnsemblId(enst.to_string()))
+            .entry(EnsemblId(strip_version(enst).to_string()))
             .or_default();
         let idx = entry.len();
 
