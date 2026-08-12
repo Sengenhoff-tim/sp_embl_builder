@@ -3,7 +3,7 @@
 // ============================================================================
 
 use crate::types::{UniProtCanonId, UniProtIsoId, UniProtId, EnsemblId};
-use crate::util::{with_retries, RateLimiter, RetryConfig};
+use crate::util::{with_retries, RateLimiter, RetryConfig, strip_version};
 use anyhow::{anyhow, Context, Result};
 use futures::stream::{self, StreamExt};
 
@@ -394,7 +394,7 @@ pub(crate) fn get_ensembl_mapping(cross_refernces: &[UniProtCrossReference]) -> 
         if cross_ref.database == "Ensembl" {
             if let Some(iso_id) = &cross_ref.isoform_id {
                 let iso_id: UniProtId = iso_id.parse().unwrap();
-                let id: EnsemblId = cross_ref.id.parse().unwrap();
+                let id: EnsemblId = strip_version(&cross_ref.id).parse().unwrap();
                 result.push((iso_id, id))
             }
         }
