@@ -44,19 +44,9 @@ fn format_ft_position_line(
 
 fn wrap_ft_qualifier(qualifier: &str, value: &str) -> Vec<String> {
     let full = format!("/{}=\"{}\"", qualifier, value);
-    let mut lines: Vec<String> = Vec::new();
-    let chars: Vec<char> = full.chars().collect();
-    let mut pos = 0;
-
-    while pos < chars.len() {
-        let chunk_end = (pos + FT_CONTENT_WIDTH).min(chars.len());
-        let chunk: String = chars[pos..chunk_end].iter().collect();
-        lines.push(format!("{}{}", FT_INDENT, chunk));
-        pos = chunk_end;
-    }
-
-    lines
+    vec![format!("{}{}", FT_INDENT, full)]
 }
+
 
 fn format_uniprot_evidence_string(evidences: &[UniProtEvidence]) -> String {
     evidences
