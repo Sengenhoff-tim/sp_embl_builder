@@ -57,6 +57,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 /// capped by the shared `RateLimiter` passed into every task, so this only
 /// bounds concurrency, not throughput.
 const MAX_CONCURRENT_ENTRIES: usize = 16;
+const ENSEMBL_MAX_REQUESTS_PER_SECOND: u32 = 15;
 
 /// Sets up `tracing` to write every `warn!`/`error!` (and above) both to
 /// stderr (for live progress) and to `exceptions_path` (for a persistent,
@@ -382,9 +383,11 @@ async fn run(
         .cloned()
         .collect();
 
+
     if !unmapped_enst_ids.is_empty() {
         if use_ensembl_fallback {
-            let enst_sequences = fetch_ensembl_sequences(&unmapped_enst_ids, retry_config).await?;
+            let ensembl_rate_limiter = &RateLimiter::per_second(ENSEMBL_MAX_REQUESTS_PER_SECOND);
+            let enst_sequences = fetch_ensembl_sequences(&unmapped_enst_ids, retry_config, ensembl_rate_limiter).await?;
             for (enst_id, seq) in &enst_sequences {
                 let variants = global_sample_variants.get(enst_id).map(Vec::as_slice).unwrap_or(&[]);
                 let mut resolved_variants = Vec::new();
