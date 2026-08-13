@@ -14,9 +14,6 @@ const ENSEMBL_SEQUENCE_URL: &str = "https://rest.ensembl.org/sequence/id";
 const MAX_IDS_PER_BATCH: usize = 50;
 const MAX_CONCURRENT_ENSEMBL_REQUESTS: usize = 5;
 
-// Ensembl's default per-client rate limit; adjust to match whatever
-// your RateLimiter expects (e.g. requests per second).
-pub(crate) const ENSEMBL_MAX_REQUESTS_PER_SECOND: u32 = 15;
 
 #[derive(Debug, Serialize)]
 struct SequenceIdPostRequest<'a> {
@@ -26,7 +23,7 @@ struct SequenceIdPostRequest<'a> {
 #[derive(Debug, Deserialize)]
 struct SequenceIdPostResponseItem {
     // Present on success
-    id: Option<String>,
+    //id: Option<String>,
     seq: Option<String>,
     // Present on per-id failure (Ensembl returns {"error": "..."} entries
     // inline in the array rather than failing the whole batch)
@@ -68,6 +65,15 @@ async fn fetch_ensembl_sequence_batch(
                 .json()
                 .await
                 .context("failed to parse Ensembl sequence POST response as JSON")?;
+
+            if items.len() != ids.len() {
+                return Err(anyhow!(
+                    "Ensembl sequence POST response length mismatch: sent {} ids, got {} entries",
+                    ids.len(),
+                    items.len()
+                ));
+            }
+
             Ok(items)
         },
     )
@@ -117,34 +123,33 @@ pub(crate) async fn fetch_ensembl_sequences_with_client(
             let client = client.clone();
             let rate_limiter = rate_limiter.clone();
             async move {
-                // Throttle per-batch (i.e. per HTTP request), not per id,
-                // since each chunk is a single POST request.
                 rate_limiter.throttle().await;
-                fetch_ensembl_sequence_batch(&chunk, &retry_config, &client).await
+                let items = fetch_ensembl_sequence_batch(&chunk, &retry_config, &client).await?;
+                Ok::<_, anyhow::Error>((chunk, items))
             }
         })
         .buffer_unordered(MAX_CONCURRENT_ENSEMBL_REQUESTS);
 
     while let Some(batch_result) = results.next().await {
-        let items = batch_result?;
-        for item in items {
-            match (item.id, item.seq, item.error) {
-                (Some(id), Some(seq), _) => {
-                    if let Some(enst_id) = id_lookup.get(&id) {
+        let (chunk, items) = batch_result?;
+        for (requested_id, item) in chunk.into_iter().zip(items.into_iter()) {
+            match (item.seq, item.error) {
+                (Some(seq), _) => {
+                    if let Some(enst_id) = id_lookup.get(&requested_id) {
                         result.insert(enst_id.clone(), seq);
                     } else {
-                        tracing::warn!(id = %id, "Ensembl returned sequence for unrequested id");
+                        tracing::warn!(id = %requested_id, "no lookup entry for requested id (bug)");
                     }
                 }
-                (id, _, Some(err)) => {
+                (_, Some(err)) => {
                     tracing::info!(
-                        id = id.as_deref().unwrap_or("<unknown>"),
+                        id = %requested_id,
                         error = %err,
                         "Ensembl reported error for id, skipping"
                     );
                 }
                 _ => {
-                    tracing::warn!("Ensembl returned malformed entry with no id/seq/error");
+                    tracing::warn!(id = %requested_id, "Ensembl returned entry with neither seq nor error");
                 }
             }
         }
