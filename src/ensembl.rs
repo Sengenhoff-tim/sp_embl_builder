@@ -134,7 +134,8 @@ pub(crate) async fn fetch_ensembl_sequences_with_client(
             match (&item.seq, &item.error) {
                 (Some(seq), _) => {
                     if let Some(enst_id) = id_lookup.get(requested_id) {
-                        result.insert(enst_id.clone(), seq.clone());
+                        let validated_seq = strip_stop_codon(enst_id.as_str(), seq.clone());
+                        result.insert(enst_id.clone(), validated_seq);
                     } else {
                         tracing::warn!(id = %requested_id, "no lookup entry for requested id (bug)");
                     }
@@ -155,7 +156,6 @@ pub(crate) async fn fetch_ensembl_sequences_with_client(
             }
         }
     }
-
     tracing::info!(
         total_results = result.len(),
         requested = enst_ids.len(),
@@ -164,3 +164,20 @@ pub(crate) async fn fetch_ensembl_sequences_with_client(
 
     Ok(result)
 }
+
+    /// Ensembl occasionally returns a translated protein sequence with containing '*' stop-codon marker (e.g. for select readthrough transcripts). 
+    /// Sequence is assumed to stop at the first stop codon
+    fn strip_stop_codon(enst: &str, seq: String) -> String {
+        match seq.find('*') {
+            Some(pos) => {
+                tracing::info!(
+                    enst = enst,
+                    "{}, sequence contained '*' stop codon at position {}; amino acids after are discarded",
+                    enst,
+                    pos
+                );
+                seq[..pos].to_string()
+            }
+            None => seq,
+        }
+    }
