@@ -52,9 +52,8 @@ async fn fetch_ensembl_sequence_batch(
                 let status = response.status();
                 let text = response.text().await.unwrap_or_default();
                 return Err(anyhow!(
-                    "Ensembl sequence POST request failed: HTTP {} body: {}",
-                    status,
-                    text
+                    "Ensembl sequence POST request failed: HTTP {}",
+                    status
                 ));
             }
 
