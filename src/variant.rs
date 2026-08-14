@@ -76,6 +76,13 @@ impl Variant {
                 self.begin
             ));
         }
+        if self.begin > seq.len() {
+            return Err(anyhow::anyhow!(
+                "Variant points position [{}] for sequence with length [{}]",
+                self.begin,
+                seq.len()
+            ));
+        }
 
         match (self.aa_ref.clone(), self.aa_new.clone()) {
             // Neither field present: nothing to resolve.
