@@ -16,6 +16,12 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub(crate) idmapping: String,
 
+    /// Comma-separated list of UniProt canonical accessions to exclude from
+    /// the final accession list (applied as the last step, after id-mapping
+    /// extension).
+    #[arg(long, value_delimiter = ',', default_value = "")]
+    pub(crate) omit_variants: Vec<String>,
+
     /// Path to ENST variant file. If omitted, no ENST-derived sample variants
     /// are included (only UniProt/EBI variants, per --uniprot-variants /
     /// --ebi-variants).
