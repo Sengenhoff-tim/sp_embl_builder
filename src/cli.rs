@@ -11,6 +11,11 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub(crate) accessions: String,
 
+    /// Path to UniProt/Ensembl id mapping file, used to extend the
+    /// accession list with accessions derived from ENST variant ids.
+    #[arg(long)]
+    pub(crate) idmapping: String,
+
     /// Path to ENST variant file. If omitted, no ENST-derived sample variants
     /// are included (only UniProt/EBI variants, per --uniprot-variants /
     /// --ebi-variants).

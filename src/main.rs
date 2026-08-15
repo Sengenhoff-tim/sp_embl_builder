@@ -33,7 +33,7 @@ use isoform::collect_and_reconstruct_isoforms;
 use tracing::info;
 use tracing_subscriber::Layer;
 use variant::*;
-use parsing::{parse_accession_list, parse_sample_variants};
+use parsing::{parse_accession_list, parse_sample_variants, parse_idmapping};
 use types::{EnsemblId, UniProtId};
 use uniprot::{fetch_uniprot_entries, UniProtEntry, get_ensembl_mapping};
 use util::RetryConfig;
@@ -115,6 +115,7 @@ async fn main() -> anyhow::Result<()>{
     run(
         &args.accessions,
         &args.variants,
+        &args.idmapping,
         args.output.as_deref(),
         &source_type_refs,
         &retry_config,
@@ -291,6 +292,7 @@ async fn process_entry(
 async fn run(
     uniprot_accessions_path: &str,
     variants_path: &Option<String>,
+    idmapping_path: &str,
     output_path: Option<&str>,
     source_types: &[&str],
     retry_config: &RetryConfig,
@@ -306,13 +308,28 @@ async fn run(
     };
 
     // 1. Parse inputs
-    let accessions = parse_accession_list(uniprot_accessions_path)?;
-    let global_sample_variants = match variants_path {
+    let mut accessions: Vec<UniProtCanonId> = parse_accession_list(uniprot_accessions_path)?;
+    let global_sample_variants: HashMap<EnsemblId, Vec<Variant>> = match variants_path {
         Some(path) => parse_sample_variants(path)?,
         None => HashMap::new(),
     };
-    let global_sample_variants = Arc::new(global_sample_variants);
 
+    // 2. Parse id mapping (EnsemblId -> UniProtCanonId) and extend accessions
+    let id_mapping: HashMap<EnsemblId, Vec<UniProtCanonId>> = parse_idmapping(idmapping_path)?;
+
+    let mut existing: HashSet<UniProtCanonId> = accessions.iter().cloned().collect();
+
+    for ensembl_id in global_sample_variants.keys() {
+        if let Some(uniprot_ids) = id_mapping.get(ensembl_id) {
+            for uniprot_id in uniprot_ids {
+                if existing.insert(uniprot_id.clone()) {
+                    accessions.push(uniprot_id.clone());
+                }
+            }
+        }
+    }
+
+    let global_sample_variants = Arc::new(global_sample_variants);
 
     let source_types_owned = Arc::new(
         source_types.iter().map(|s| s.to_string()).collect::<Vec<String>>()
