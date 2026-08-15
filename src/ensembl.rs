@@ -50,10 +50,10 @@ async fn fetch_ensembl_sequence_batch(
 
             if !response.status().is_success() {
                 let status = response.status();
-                let text = response.text().await.unwrap_or_default();
                 return Err(anyhow!(
-                    "Ensembl sequence POST request failed: HTTP {}",
-                    status
+                    "Ensembl sequence POST request failed: HTTP {} for id batch [{}]",
+                    status,
+                    ids.join(",")
                 ));
             }
 
