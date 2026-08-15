@@ -417,7 +417,7 @@ async fn run(
     if !unmapped_enst_ids.is_empty() {
         if use_ensembl_fallback {
             let ensembl_rate_limiter = &RateLimiter::per_second(ENSEMBL_MAX_REQUESTS_PER_SECOND);
-            let enst_sequences = fetch_ensembl_sequences(&unmapped_enst_ids, retry_config, ensembl_rate_limiter).await?;
+            let enst_sequences = fetch_ensembl_sequences(&unmapped_enst_ids, retry_config).await?;
             for (enst_id, seq) in &enst_sequences {
                 let variants = global_sample_variants.get(enst_id).map(Vec::as_slice).unwrap_or(&[]);
                 let mut resolved_variants = Vec::new();
