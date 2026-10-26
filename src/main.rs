@@ -33,7 +33,7 @@ use isoform::collect_and_reconstruct_isoforms;
 use tracing::info;
 use tracing_subscriber::Layer;
 use variant::*;
-use parsing::{parse_accession_list, parse_sample_variants};
+use parsing::{parse_accession_list, parse_sample_variants, parse_idmapping};
 use types::{EnsemblId, UniProtId};
 use uniprot::{fetch_uniprot_entries, UniProtEntry, get_ensembl_mapping};
 use util::RetryConfig;
@@ -57,6 +57,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 /// capped by the shared `RateLimiter` passed into every task, so this only
 /// bounds concurrency, not throughput.
 const MAX_CONCURRENT_ENTRIES: usize = 16;
+const ENSEMBL_MAX_REQUESTS_PER_SECOND: u32 = 15;
 
 /// Sets up `tracing` to write every `warn!`/`error!` (and above) both to
 /// stderr (for live progress) and to `exceptions_path` (for a persistent,
@@ -114,6 +115,8 @@ async fn main() -> anyhow::Result<()>{
     run(
         &args.accessions,
         &args.variants,
+        &args.idmapping,
+        &args.omit_accessions,
         args.output.as_deref(),
         &source_type_refs,
         &retry_config,
@@ -180,7 +183,7 @@ async fn process_entry(
     // collect ensembl variants
     let mut entry_sample_variants: Vec<Variant> = Vec::new();
 
-    let entry_ensembl_map = get_ensembl_mapping(&entry.cross_references)?;
+    let entry_ensembl_map = get_ensembl_mapping(&entry.primary_accession, &entry.cross_references)?;
 
     for (uniprot_id, ensembl_id) in entry_ensembl_map {
         let matches = match &uniprot_id {
@@ -290,6 +293,8 @@ async fn process_entry(
 async fn run(
     uniprot_accessions_path: &str,
     variants_path: &Option<String>,
+    idmapping_path: &str,
+    omit_accessions: &Option<std::path::PathBuf>,
     output_path: Option<&str>,
     source_types: &[&str],
     retry_config: &RetryConfig,
@@ -305,11 +310,45 @@ async fn run(
     };
 
     // 1. Parse inputs
-    let accessions = parse_accession_list(uniprot_accessions_path)?;
-    let global_sample_variants = match variants_path {
+    let mut accessions: Vec<UniProtCanonId> = parse_accession_list(uniprot_accessions_path)?;
+    let global_sample_variants: HashMap<EnsemblId, Vec<Variant>> = match variants_path {
         Some(path) => parse_sample_variants(path)?,
         None => HashMap::new(),
     };
+
+    // 2. Parse id mapping (EnsemblId -> UniProtCanonId) and extend accessions
+    let id_mapping: HashMap<EnsemblId, Vec<UniProtCanonId>> = parse_idmapping(idmapping_path)?;
+
+    let mut existing: HashSet<UniProtCanonId> = accessions.iter().cloned().collect();
+
+    for ensembl_id in global_sample_variants.keys() {
+        if let Some(uniprot_ids) = id_mapping.get(ensembl_id) {
+            for uniprot_id in uniprot_ids {
+                if existing.insert(uniprot_id.clone()) {
+                    accessions.push(uniprot_id.clone());
+                }
+            }
+        }
+    }
+
+    let omit: HashSet<UniProtCanonId> = match &omit_accessions {
+        Some(path) => {
+            let file = std::fs::File::open(path)?;
+            std::io::BufRead::lines(std::io::BufReader::new(file))
+                .collect::<std::io::Result<Vec<String>>>()?
+                .iter()
+                .map(|line| line.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.parse::<UniProtCanonId>().expect("infallible"))
+                .collect()
+        }
+        None => HashSet::new(),
+    };
+
+    if !omit.is_empty() {
+        accessions.retain(|id| !omit.contains(id));
+    }
+
     let global_sample_variants = Arc::new(global_sample_variants);
 
     let source_types_owned = Arc::new(
@@ -381,8 +420,10 @@ async fn run(
         .cloned()
         .collect();
 
+
     if !unmapped_enst_ids.is_empty() {
         if use_ensembl_fallback {
+            let ensembl_rate_limiter = &RateLimiter::per_second(ENSEMBL_MAX_REQUESTS_PER_SECOND);
             let enst_sequences = fetch_ensembl_sequences(&unmapped_enst_ids, retry_config).await?;
             for (enst_id, seq) in &enst_sequences {
                 let variants = global_sample_variants.get(enst_id).map(Vec::as_slice).unwrap_or(&[]);

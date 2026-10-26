@@ -108,7 +108,6 @@ async fn fetch_variation_single(
 
             if !response.status().is_success() {
                 let status = response.status();
-                let body = response.text().await.unwrap_or_default();
                 return Err(anyhow!("EBI variation request failed: URL: [{}]; HTTP {}",url, status));
             }
 
@@ -210,7 +209,7 @@ pub(crate) fn feature_to_iso_variant(accession: &UniProtIsoId, feature: &EbiFeat
     if let Some(replaced) = &feature.wild_type {
         let begin: usize = feature.begin.parse().ok()?;
         let end = begin + replaced.len().checked_sub(1)?;
-        let id = "EBI".to_string();
+        let id = format!("EBI{}_{}_{}",feature.ft_id.clone().unwrap_or("".to_string()),begin, replaced );
         let isoform = Some(accession.clone());
         return Some(Variant {isoform, id, begin, end, aa_ref: Some(replaced.to_string()), aa_new: feature.mutated_type.clone() })
     }
@@ -222,7 +221,7 @@ pub(crate) fn feature_to_canon_variant(accession: &str, feature: &EbiFeature) ->
     if let Some(replaced) = &feature.wild_type {
         let begin: usize = feature.begin.parse().ok()?;
         let end = begin + replaced.len().checked_sub(1)?;
-        let id = format!("EBI{}{}",begin, replaced );
+        let id = format!("EBI{}_{}_{}",feature.ft_id.clone().unwrap_or("".to_string()),begin, replaced );
         let isoform = None;
         return Some(Variant {isoform, id, begin, end, aa_ref: Some(replaced.to_string()), aa_new: feature.mutated_type.clone() })
     }

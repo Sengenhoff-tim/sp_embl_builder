@@ -4,6 +4,7 @@
 
 use crate::types::{EnsemblId, UniProtCanonId};
 use crate::variant::Variant;
+use crate::util::strip_version;
 use anyhow::{Context, Result};
 use tracing::info;
 use std::collections::HashMap;
@@ -60,6 +61,57 @@ fn to_variant(id: &str, variant_str: &str) -> Option<Variant> {
     })
 }
 
+/// Parses a UniProt-canonical/Ensembl transcript id mapping file, returning a
+/// map of Ensembl-ID → list of UniProt-Canon-IDs (an ENST can map to more
+/// than one UniProt accession).
+///
+/// Expected format: tab-separated `<uniprot_id>[-<isoform>]\t<enst_id>[.<version>]`
+/// e.g. "P62258-2\tENST00000571732.5" -> (ENST00000571732, [P62258])
+pub(crate) fn parse_idmapping(path: &str) -> Result<HashMap<EnsemblId, Vec<UniProtCanonId>>> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("failed to read id mapping file '{}'", path))?;
+    let mut mapping: HashMap<EnsemblId, Vec<UniProtCanonId>> = HashMap::new();
+    for (line_no, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let identifier = format!("{}:{}", path, line_no + 1);
+
+        let mut parts = line.split('\t');
+        let uniprot_raw = match parts.next() {
+            Some(u) => u,
+            None => continue,
+        };
+        let enst_raw = match parts.next() {
+            Some(e) => e,
+            None => {
+                info!("{},missing ENST field for {}", &identifier, uniprot_raw);
+                continue;
+            }
+        };
+
+        // e.g. "P62258-2" -> "P62258"
+        let uniprot_id = uniprot_raw.split('-').next().unwrap_or(uniprot_raw);
+        // e.g. "ENST00000571732.5" -> "ENST00000571732"
+        let enst_id = strip_version(enst_raw);
+
+        if !enst_id.starts_with("ENST") {
+            info!("{},'{}' does not look like an ENST id; skipping line", &identifier, enst_raw);
+            continue;
+        }
+
+        let entry = mapping
+            .entry(EnsemblId(enst_id.to_string()))
+            .or_default();
+        let uniprot_id = UniProtCanonId(uniprot_id.to_string());
+        if !entry.contains(&uniprot_id) {
+            entry.push(uniprot_id);
+        }
+    }
+    Ok(mapping)
+}
+
 /// parse a ensembl transcript mapped variant input file, returning a map of Ensembl-ID → list of variants.
 pub(crate) fn parse_sample_variants(
     path: &str,
@@ -113,13 +165,13 @@ pub(crate) fn parse_sample_variants(
 
         // get entry for variant index
         let entry = variants
-            .entry(EnsemblId(enst.to_string()))
+            .entry(EnsemblId(strip_version(enst).to_string()))
             .or_default();
         let idx = entry.len();
 
         // e.g. "726G>726S" -> Some(Variant { .. }); "garbage!!" -> None, logged and skipped
         // variant id is set to "{ensembl_id_versionless}:{idx}" so that each variant has a unique id
-        let variant = match to_variant(&format!("{}{}", enst, idx), variant_string) {
+        let variant = match to_variant(&format!("{}_{}", enst, idx), variant_string) {
             Some(v) => v,
             None => {
                 info!("{},could not parse variant '{}' for {}", &identifier, variant_string, enst);
