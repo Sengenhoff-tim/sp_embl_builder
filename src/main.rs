@@ -116,7 +116,7 @@ async fn main() -> anyhow::Result<()>{
         &args.accessions,
         &args.variants,
         &args.idmapping,
-        &args.omit_variants,
+        &args.omit_accessions,
         args.output.as_deref(),
         &source_type_refs,
         &retry_config,
@@ -294,7 +294,7 @@ async fn run(
     uniprot_accessions_path: &str,
     variants_path: &Option<String>,
     idmapping_path: &str,
-    omit_variants: &Vec<String>,
+    omit_accessions: &Option<std::path::PathBuf>,
     output_path: Option<&str>,
     source_types: &[&str],
     retry_config: &RetryConfig,
@@ -331,12 +331,19 @@ async fn run(
         }
     }
 
-    let omit: HashSet<UniProtCanonId> = omit_variants
-        .iter()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| UniProtCanonId(s.to_string()))
-        .collect();
+    let omit: HashSet<UniProtCanonId> = match &omit_accessions {
+        Some(path) => {
+            let file = std::fs::File::open(path)?;
+            std::io::BufRead::lines(std::io::BufReader::new(file))
+                .collect::<std::io::Result<Vec<String>>>()?
+                .iter()
+                .map(|line| line.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.parse::<UniProtCanonId>().expect("infallible"))
+                .collect()
+        }
+        None => HashSet::new(),
+    };
 
     if !omit.is_empty() {
         accessions.retain(|id| !omit.contains(id));
